@@ -1,0 +1,131 @@
+---
+title: 'Pluto Trial: BHM'
+author: "Ethan Alt"
+date: "01/12/2023"
+output: 
+  html_document:
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+set.seed(123)
+knitr::opts_chunk$set(echo = TRUE)
+library(cmdstanr)
+check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
+register_knitr_engine(override = FALSE)
+```
+
+
+### Stan code
+Below, we implement the Stan code for the power prior.
+```{cmdstan, output.var="bhm_model", message=FALSE}
+data {
+  int<lower=0> J;                   // num. of data sets
+  array[J] int<lower=0> ntrt;       // num. treated patients in historical data sets
+  array[J] int<lower=0> nctrl;      // num. placebo patients in historical data sets
+  array[J] int<lower=0> ytrt;       // num. responders in treated group for historical data sets
+  array[J] int<lower=0> yctrl;      // num. responders in placebo group for historical data sets
+  real betamean_mean;               // mean parameter for hierarchical mean
+  real<lower=0> betamean_sd;        // sd parameter for hierarchical mean
+}
+parameters {
+  vector[J] intercept;             // intercept
+  vector[J] trteff;                // treatment effect
+  real intercept_mean;             // hierarchical mean for intercept
+  real trteff_mean;                // hierarchical mean for treatment effect
+  real<lower=0> intercept_sd;      // hierarchical SD For intercept
+  real<lower=0> trteff_sd;         // hierarchical SD for treatment effect
+}
+model {
+  // Priors for hierarchical parameters
+  intercept_mean ~ normal(betamean_mean, betamean_sd);
+  trteff_mean ~ normal(betamean_mean, betamean_sd);
+  intercept_sd ~ cauchy(0, 1);
+  trteff_sd ~ cauchy(0, 1);
+  // Loop through number of studies
+  for ( j in 1:J ) {
+    // Priors for model parameters
+    target += normal_lpdf(intercept[j] | intercept_mean, intercept_sd);
+    target += normal_lpdf(trteff[j] | trteff_mean, trteff_sd);
+    // Likelihood contribution
+    target += binomial_logit_lpmf(ytrt[j] | ntrt[j], intercept[j] + trteff[j]);
+    target += binomial_logit_lpmf(yctrl[j] | nctrl[j], intercept[j]);
+  }
+}
+generated quantities {
+  real theta1 = inv_logit(intercept[1] + trteff[1]);
+  real theta0 = inv_logit(intercept[1]);
+  real risk_difference = theta1 - theta0;
+  real risk_ratio = theta1 * inv(theta0);  // = theta1 / theta0
+  real odds_ratio = (theta1 * inv(1-theta1)) * inv(theta0 * inv(1-theta0));
+}
+```
+
+
+
+### Analysis in R
+#### Load packages
+```{r, message = F, warning = F}
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(tidyverse)
+```
+
+#### Creation of the Stan data
+
+Now, we must tell `stan` what the variables named in the `data{}` block are.
+This is done by creating a named list as follows.
+
+```{r}
+## Create data set
+standata <- list(
+    'J'      = 3
+  , 'ntrt'  = c(53, 273, 290)
+  , 'nctrl' = c(39, 275, 287)
+  , 'ytrt'  = c(28, 118, 167)
+  , 'yctrl' = c(17, 93, 125)
+  , 'betamean_mean' = 0
+  , 'betamean_sd' = 5
+)
+
+## Conduct MCMC sampling
+bhm_smpl <- bhm_model$sample(
+  data = standata, iter_warmup = 2000, iter_sampling = 2500
+  , chains = 4, parallel_chains = 4, refresh = 0
+)
+```
+
+We can obtain posterior mean, SD, 95%, and posterior probabilities as follows:
+```{r}
+parmnames <- c('intercept', 'trteff')
+suffix    <- c('[1]', '_mean', '_sd')
+pars      <- apply(expand.grid(parmnames, suffix), 1, paste, collapse="")
+pars      <- c(pars, 'theta1', 'theta0', 'odds_ratio', 'risk_difference', 'risk_ratio')
+
+bhm_smpl$summary(
+  variables = pars,'mean', 'sd', 'q' = ~quantile2(.x, probs = c(0.025, 0.975))
+  , 'p_gt_0' = ~mean(.x > 0), 'p_gt_1' =~ mean(.x > 1)
+)
+```
+
+The trace plots are:
+
+```{r}
+bhm_mcmc <- bhm_smpl$draws()
+bhm_mcmc %>% mcmc_trace()
+```
+
+
+Plotting the densities, by chain
+
+```{r}
+bhm_mcmc %>% mcmc_dens_overlay()
+```
+
+and the histogram combining chains...
+
+```{r}
+bhm_mcmc %>% mcmc_hist()
+```

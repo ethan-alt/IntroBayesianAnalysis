@@ -1,5 +1,5 @@
 ---
-title: 'Example: Power Prior'
+title: 'Pluto Trial: Normalized Power Prior'
 author: "Ethan Alt"
 date: "01/12/2023"
 output: 

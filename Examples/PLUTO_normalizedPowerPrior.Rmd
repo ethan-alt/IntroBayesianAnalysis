@@ -1,0 +1,138 @@
+---
+title: 'Example: Power Prior'
+author: "Ethan Alt"
+date: "01/12/2023"
+output: 
+  html_document:
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+set.seed(123)
+knitr::opts_chunk$set(echo = TRUE)
+library(cmdstanr)
+check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
+register_knitr_engine(override = FALSE)
+```
+
+
+### Stan code
+Below, we implement the Stan code for the power prior.
+```{cmdstan, output.var="npp_model", message=FALSE}
+data {
+  int<lower=0> ntrt;                 // num. treated patients in current data set
+  int<lower=0> nctrl;                // num. placebo patients in current data set
+  int<lower=0,upper=ntrt> ytrt;      // num. responders in treated group
+  int<lower=0,upper=nctrl> yctrl;    // num. responders in control group
+  int<lower=0> J;                    // num. of historical data sets
+  array[J] int<lower=0> ntrt0;       // num. treated patients in historical data sets
+  array[J] int<lower=0> nctrl0;      // num. placebo patients in historical data sets
+  array[J] int<lower=0> ytrt0;       // num. responders in treated group for historical data sets
+  array[J] int<lower=0> yctrl0;      // num. responders in placebo group for historical data sets
+  real<lower=0> theta_shape1;        // first shape hyperparameter for initial beta prior
+  real<lower=0> theta_shape2;        // second shape hyperparameter for initial beta prior
+  real<lower=0> a0_shape1;           // first shape hyperparameter for beta prior on a0
+  real<lower=0> a0_shape2;           // second shape hyperparameter for beta prior on a0
+}
+parameters {
+  real<lower=0,upper=1> theta1;  // probability of responding among treated
+  real<lower=0,upper=1> theta0;  // probability of responding among placebo
+  vector<lower=0,upper=1>[J] a0; // power prior parameters
+}
+model {
+  // normalized power priors
+  real theta1_shape1 = theta_shape1;
+  real theta1_shape2 = theta_shape2;
+  real theta0_shape1 = theta_shape1;
+  real theta0_shape2 = theta_shape2;
+  for ( j in 1:J ) {
+    theta1_shape1 += a0[j] * ytrt0[j];
+    theta1_shape2 += a0[j] * (ntrt0[j] - ytrt0[j]);
+    theta0_shape1 += a0[j] * yctrl0[j];
+    theta0_shape2 += a0[j] * (nctrl0[j] - yctrl0[j]);
+  }
+  // must use target += so normalizing constant is included
+  target += beta_lpdf(theta1 | theta1_shape1, theta1_shape2);
+  target += beta_lpdf(theta0 | theta0_shape1, theta0_shape2);
+  
+  // Prior for a0
+  a0 ~ beta(a0_shape1, a0_shape2);
+  
+  // likelihood
+  ytrt ~ binomial(ntrt, theta1);
+  yctrl ~ binomial(nctrl, theta0);
+}
+generated quantities {
+  real risk_difference = theta1 - theta0;
+  real risk_ratio = theta1 * inv(theta0);  // = theta1 / theta0
+  real odds_ratio = (theta1 * inv(1-theta1)) / (theta0 * inv(1-theta0));
+}
+```
+
+
+
+### Analysis in R
+#### Load packages
+```{r}
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(tidyverse)
+```
+
+#### Creation of the Stan data
+
+Now, we must tell `stan` what the variables named in the `data{}` block are.
+This is done by creating a named list as follows.
+
+```{r}
+## Create data set
+standata <- list(
+    'ntrt'   = 53
+  , 'nctrl'  = 39
+  , 'ytrt'   = 28
+  , 'yctrl'  = 17
+  , 'J'      = 2
+  , 'ntrt0'  = c(273, 290)
+  , 'nctrl0' = c(275, 287)
+  , 'ytrt0'  = c(118, 167)
+  , 'yctrl0' = c(93, 125)
+  , 'theta_shape1' = 0.5
+  , 'theta_shape2' = 0.5
+  , 'a0_shape1'    = 1
+  , 'a0_shape2'    = 1
+)
+
+## Conduct MCMC sampling
+npp_smpl <- npp_model$sample(
+  data = standata, iter_warmup = 2000, iter_sampling = 2500
+  , chains = 4, parallel_chains = 4, refresh = 0
+)
+```
+
+We can obtain posterior mean, SD, 95% CI as follows:
+```{r}
+npp_smpl$summary(variables = NULL,'mean', 'sd', 'q' = ~quantile2(.x, probs = c(0.025, 0.975)))
+```
+
+Checking trace plots is always a good idea.
+```{r}
+npp_mcmc <- npp_smpl$draws()
+npp_mcmc %>% mcmc_trace()
+```
+As we can see, there is an extreme value for the risk ratio
+and odds ratio. We may wish to inspect this further. However, since it appears
+to be only one draw, it will not affect inference very much.
+
+Plotting the densities, by chain
+
+```{r}
+npp_mcmc %>% mcmc_dens_overlay()
+```
+
+and the histogram combining chains...
+
+```{r}
+npp_mcmc %>% mcmc_hist()
+```

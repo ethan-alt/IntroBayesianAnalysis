@@ -1,0 +1,163 @@
+---
+title: 'Example: Power Prior'
+author: "Ethan Alt"
+date: "01/12/2023"
+output: 
+  html_document:
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(cmdstanr)
+check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
+register_knitr_engine(override = FALSE)
+```
+
+
+### Stan code
+Below, we implement the Stan code for the power prior.
+```{cmdstan, output.var="model"}
+data {
+  int<lower=0> ntrt;                 // num. treated patients in current data set
+  int<lower=0> nctrl;                // num. placebo patients in current data set
+  int<lower=0,upper=ntrt> ytrt;      // num. responders in treated group
+  int<lower=0,upper=nctrl> yctrl;    // num. responders in control group
+  int<lower=0> J;                    // num. of historical data sets
+  array[J] int<lower=0> ntrt0;       // num. treated patients in historical data sets
+  array[J] int<lower=0> nctrl0;      // num. placebo patients in historical data sets
+  array[J] int<lower=0> ytrt0;       // num. responders in treated group for historical data sets
+  array[J] int<lower=0> yctrl0;      // num. responders in placebo group for historical data sets
+  array[J] real<lower=0,upper=1> a0; // discounting parameter (could also be vector type)
+  real<lower=0> theta_shape1;        // first shape hyperparameter for initial beta prior
+  real<lower=0> theta_shape2;        // second shape hyperparameter for initial beta prior
+}
+parameters {
+  real<lower=0,upper=1> theta1;  // probability of responding among treated
+  real<lower=0,upper=1> theta0;  // probability of responding among placebo
+}
+model {
+  // power priors
+  for ( j in 1:J ) {
+    target += a0[j] * binomial_lpmf(ytrt0[j] | ntrt0[j], theta1);    // power prior for treated in j-th data set
+    target += a0[j] * binomial_lpmf(yctrl0[j] | nctrl0[j], theta0);  // power prior for placebo in j-th data set
+  }
+  theta1 ~ beta(theta_shape1, theta_shape2);   // initial prior
+  theta0 ~ beta(theta_shape1, theta_shape2);   // initial prior
+  
+  // likelihood
+  ytrt ~ binomial(ntrt, theta1);
+  yctrl ~ binomial(nctrl, theta0);
+}
+generated quantities {
+  real risk_difference = theta1 - theta0;
+  real risk_ratio = theta1 * inv(theta0);  // = theta1 / theta0
+  real odds_ratio = (theta1 * inv(1-theta1)) / (theta0 * inv(1-theta0));
+}
+```
+
+
+In an R session, we would compile the Stan code as follows:
+```{r, eval = FALSE}
+library(cmdstanr)
+model <- cmdstan_model('path/to/file/filename.stan')
+```
+
+
+### Setup
+First, we load required libraries
+```{r, message = FALSE, warning = FALSE}
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(tidyverse)
+```
+
+### Analysis in R
+#### Creation of the Stan data
+Now, we must tell `stan` what the variables named in the `data{}` block are.
+This is done by creating a named list as follows.
+```{r}
+## Create data set
+standata <- list(
+    'ntrt'   = 53
+  , 'nctrl'  = 39
+  , 'ytrt'   = 28
+  , 'yctrl'  = 17
+  , 'J'      = 2
+  , 'ntrt0'  = c(273, 290)
+  , 'nctrl0' = c(275, 287)
+  , 'ytrt0'  = c(118, 167)
+  , 'yctrl0' = c(93, 125)
+  , 'theta_shape1' = 0.5
+  , 'theta_shape2' = 0.5
+)
+(n <- with(standata, ntrt + nctrl))
+standata$a0 <- c(0.1, 0.1)
+
+## Conduct MCMC sampling
+smpl <- model$sample(
+  data = standata, iter_warmup = 2000, iter_sampling = 2500
+  , chains = 4, parallel_chains = 4, refresh = 0
+)
+```
+To access the samples, we use the `draws` method, which in turn uses the
+convenient `posterior` package. We will obtain the draws via a special `data.frame`
+called a `draws_df`.
+```{r}
+mcmc <- smpl$draws(format = 'draws_df')
+mcmc %>% summarize_draws()
+```
+
+By default, the `summarize_draws()` method gives $90\%$ credible intervals. To
+obtain a 95\% CI, we can do the following:
+```{r}
+mcmc %>% summarize_draws(quantile2, .args = list(probs = c(0.025, 0.975)))
+```
+
+More generally, we can summarize different posterior quantities
+```{r}
+mcmc %>% summarize_draws(
+  'mean', 'sd', ~quantile(.x, probs = c(0.025, 0.975)), 'pgt0' = ~mean(.x > 0), 'pgt1' = ~mean(.x > 1)
+)
+```
+
+
+In this case, the trial would be unsuccessful. Let's see what happens when
+we change $a_{01} = a_{02} = 0.3$
+```{r}
+standata$a0 <- rep(0.2, 2)
+smpl2 <- model$sample(
+  data = standata, iter_warmup = 2000, iter_sampling = 2500
+  , chains = 4, parallel_chains = 4, refresh = 0
+)
+mcmc2 <- smpl2$draws(format = 'draws_df')
+mcmc2 %>% summarize_draws(
+  'mean', 'sd', ~quantile(.x, probs = c(0.025, 0.975)), 'pgt0' = ~mean(.x > 0), 'pgt1' = ~mean(.x > 1)
+)
+```
+
+
+### Plots
+The `bayesplot` package provides nice diagnostic plots. 
+
+
+#### Trace plots
+Trace plots show how the MCMC converges. Ideally, we want to see lines randomly
+fluctuating.
+```{r}
+mcmc2 %>% mcmc_trace()
+```
+#### Autocorrelation plots
+Autocorrelation can sometimes be problematic as it can indicate that the
+chain is "stuck". 
+```{r}
+mcmc2 %>% mcmc_acf()
+```
+### Posterior plots
+Oftentimes, it's useful to plot the posterior distribution of each parameter
+```{r}
+## Posterior histogram
+mcmc2 %>% mcmc_hist()
+```

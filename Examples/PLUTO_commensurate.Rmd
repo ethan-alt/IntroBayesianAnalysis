@@ -9,7 +9,7 @@ output:
 ---
 
 ```{r setup, include=FALSE}
-set.seed(123)
+set.seed(1234)
 knitr::opts_chunk$set(echo = TRUE)
 library(cmdstanr)
 check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
@@ -34,10 +34,10 @@ data {
   int<lower=0,upper=nctrl0> yctrl0;   // num. responders in placebo in current data set
   real beta0_mean;                    // mean for initial prior on historical data
   real beta0_sd;                      // SD for initial prior on historical data
-  real<lower=0> tau_slab_min;         // slab: tau ~ U(tau_slab_min, tau_slab_max)
-  real<lower=tau_slab_min> tau_slab_max;
-  real tau_spike_mean;                // mean parameter for spike prior on tau
-  real tau_spike_sd;                  // sd parameter for spike prior on tau
+  real<lower=0> tau_spike_min;         // slab: tau ~ U(tau_spike_min, tau_spike_max)
+  real<lower=tau_spike_min> tau_spike_max;
+  real tau_slab_mean;                // mean parameter for spike prior on tau
+  real tau_slab_sd;                  // sd parameter for spike prior on tau
 }
 parameters {
   real intercept;                     // intercept for current data
@@ -61,13 +61,13 @@ model {
   // Spike and slab prior for commensurability parameters
   target += log_mix(
     spikeprob
-    , normal_lpdf(tau_intercept | tau_spike_mean, tau_spike_sd)
-    , uniform_lpdf(tau_intercept | 0, tau_slab_max)
+    , normal_lpdf(tau_intercept | tau_slab_mean, tau_slab_sd)
+    , uniform_lpdf(tau_intercept | 0, tau_spike_max)
   );
   target += log_mix(
     spikeprob
-    , uniform_lpdf(tau_trteff | tau_slab_min, tau_slab_max)
-    , normal_lpdf(tau_trteff | tau_spike_mean, tau_spike_sd)
+    , uniform_lpdf(tau_trteff | tau_spike_min, tau_spike_max)
+    , normal_lpdf(tau_trteff | tau_slab_mean, tau_slab_sd)
   );
   // Likelihood of historical data set
   ytrt0 ~ binomial_logit(ntrt0, intercept0 + trteff0);
@@ -119,10 +119,10 @@ standata <- list(
   , 'yctrl0' = 93 + 125
   , 'beta0_mean'     = 0
   , 'beta0_sd'       = 10
-  , 'tau_slab_min'   = 0.1
-  , 'tau_slab_max'   = 0.5
-  , 'tau_spike_mean' = 20
-  , 'tau_spike_sd'   = 1
+  , 'tau_spike_min'   = 0.1
+  , 'tau_spike_max'   = 0.5
+  , 'tau_slab_mean' = 20
+  , 'tau_slab_sd'   = 1
 )
 
 ## Conduct MCMC sampling
@@ -136,7 +136,7 @@ We can obtain posterior mean, SD, 95%, and posterior probabilities as follows:
 
 ```{r}
 pars <- c(
-  'intercept', 'trteff', 'tau_intercept', 'tau_trteff', 'theta1', 'theta0'
+  'intercept', 'trteff', 'intercept0', 'trteff0', 'tau_intercept', 'tau_trteff', 'theta1', 'theta0'
   , 'risk_difference', 'spikeprob'
 )
 

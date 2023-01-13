@@ -1,0 +1,160 @@
+---
+title: 'Pluto Trial: Commensurate Prior'
+author: "Ethan Alt"
+date: "01/12/2023"
+output: 
+  html_document:
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+set.seed(123)
+knitr::opts_chunk$set(echo = TRUE)
+library(cmdstanr)
+check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
+register_knitr_engine(override = FALSE)
+```
+
+
+### Stan code
+
+Below, we implement the Stan code for the commensurate prior. The compiled
+object exists in a variable named `cp_model`.
+
+```{cmdstan, output.var="cp_model", message=FALSE}
+data {
+  int<lower=0> ntrt;                  // num. treated patients in current data set
+  int<lower=0> nctrl;                 // num. placebo patients in current data set
+  int<lower=0> ntrt0;                 // num. treated patients in historical data set
+  int<lower=0> nctrl0;                // num. placebo patients in historical data set
+  int<lower=0,upper=ntrt> ytrt;       // num. responders in treated in current data set
+  int<lower=0,upper=nctrl> yctrl;     // num. responders in placebo in current data set
+  int<lower=0,upper=ntrt0> ytrt0;     // num. responders in treated in current data set
+  int<lower=0,upper=nctrl0> yctrl0;   // num. responders in placebo in current data set
+  real beta0_mean;                    // mean for initial prior on historical data
+  real beta0_sd;                      // SD for initial prior on historical data
+  real<lower=0> tau_slab_min;         // slab: tau ~ U(tau_slab_min, tau_slab_max)
+  real<lower=tau_slab_min> tau_slab_max;
+  real tau_spike_mean;                // mean parameter for spike prior on tau
+  real tau_spike_sd;                  // sd parameter for spike prior on tau
+}
+parameters {
+  real intercept;                     // intercept for current data
+  real trteff;                        // treatment effect for current data
+  real intercept0;                    // intercept for historical data
+  real trteff0;                       // treatment effect for historical data
+  real<lower=0> tau_intercept;        // commensurability for intercept
+  real<lower=0> tau_trteff;           // commensurability for treatment effect
+  real<lower=0,upper=1> spikeprob;    // Pr(spike) = 1 - Pr(slab)
+}
+model {
+  // ------------------- Priors ----------------------------------
+  real sd_intercept = inv_sqrt(tau_intercept);
+  real sd_trteff = inv_sqrt(tau_trteff);
+  // current params are normally distributed about historical params
+  target += normal_lpdf(intercept | intercept0, sd_intercept);
+  target += normal_lpdf(trteff | trteff, sd_trteff);
+  // Initial prior for historical data set
+  target += normal_lpdf(intercept0 | beta0_mean, beta0_sd);
+  target += normal_lpdf(trteff0 | beta0_mean, beta0_sd);
+  // Spike and slab prior for commensurability parameters
+  target += log_mix(
+    spikeprob
+    , normal_lpdf(tau_intercept | tau_spike_mean, tau_spike_sd)
+    , uniform_lpdf(tau_intercept | 0, tau_slab_max)
+  );
+  target += log_mix(
+    spikeprob
+    , uniform_lpdf(tau_trteff | tau_slab_min, tau_slab_max)
+    , normal_lpdf(tau_trteff | tau_spike_mean, tau_spike_sd)
+  );
+  // Likelihood of historical data set
+  ytrt0 ~ binomial_logit(ntrt0, intercept0 + trteff0);
+  yctrl0 ~ binomial_logit(nctrl0, intercept0);
+  // -------------------------------------------------------------
+  
+  // Likelihood of current data set
+  ytrt ~ binomial_logit(ntrt, intercept + trteff);
+  yctrl ~ binomial_logit(nctrl, intercept);
+}
+generated quantities {
+  real theta1 = inv_logit(intercept + trteff);
+  real theta0 = inv_logit(intercept);
+  real risk_difference = theta1 - theta0;
+  real risk_ratio = theta1 * inv(theta0);  // = theta1 / theta0
+  real odds_ratio = (theta1 * inv(1-theta1)) * inv(theta0 * inv(1-theta0));
+}
+```
+
+
+
+### Analysis in R
+
+#### Load packages
+
+```{r, message = F, warning = F}
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(tidyverse)
+```
+
+#### Creation of the Stan data
+
+Now, we must tell `stan` what the variables named in the `data{}` block are.
+This is done by creating a named list as follows.
+
+```{r, warning = FALSE}
+## Create data set
+standata <- list(
+    'J'      = 3
+  , 'ntrt'   = 53
+  , 'nctrl'  = 39
+  , 'ntrt0'  = 273 + 290
+  , 'nctrl0' = 275 + 287
+  , 'ytrt'   = 28
+  , 'yctrl'  = 17
+  , 'ytrt0'  = 118 + 167
+  , 'yctrl0' = 93 + 125
+  , 'beta0_mean'     = 0
+  , 'beta0_sd'       = 10
+  , 'tau_slab_min'   = 0.1
+  , 'tau_slab_max'   = 0.5
+  , 'tau_spike_mean' = 20
+  , 'tau_spike_sd'   = 1
+)
+
+## Conduct MCMC sampling
+cp_smpl <- cp_model$sample(
+  data = standata, iter_warmup = 2000, iter_sampling = 10000, refresh = 0
+  , chains = 1
+)
+```
+
+We can obtain posterior mean, SD, 95%, and posterior probabilities as follows:
+
+```{r}
+pars <- c(
+  'intercept', 'trteff', 'tau_intercept', 'tau_trteff', 'theta1', 'theta0'
+  , 'risk_difference', 'spikeprob'
+)
+
+cp_smpl$summary(
+  variables = pars,'mean', 'sd', 'q' = ~quantile2(.x, probs = c(0.025, 0.975))
+  , 'p_gt_0' = ~mean(.x > 0), 'p_gt_1' =~ mean(.x > 1)
+)
+```
+
+The trace plots are:
+
+```{r}
+cp_mcmc <- cp_smpl$draws()
+cp_mcmc %>% mcmc_trace(pars = pars)
+```
+
+and the histogram
+
+```{r}
+cp_mcmc %>% mcmc_hist(pars = pars)
+```

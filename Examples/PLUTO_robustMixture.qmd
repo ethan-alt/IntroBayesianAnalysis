@@ -1,0 +1,132 @@
+---
+title: "PLUTO: Robust Mixture Example"
+author: "Ethan Alt"
+date: 01/13/2023
+format: html
+editor: visual
+---
+
+### 
+
+```{r setup, include=FALSE}
+set.seed(123)
+knitr::opts_chunk$set(echo = TRUE)
+library(cmdstanr)
+check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
+register_knitr_engine(override = FALSE)
+```
+
+### Stan Code
+
+The following Stan file is loaded in `cmdstanr` as `rm_model`.
+
+```{cmdstan, output.var="rm_model", message=FALSE}
+data { 
+  int<lower=0> ncomp;                   // num. of components in mixture prior
+  int<lower=0> ntrt;                    // number of patients in current data assigned to treatment
+  int<lower=0> nctrl;                   // number of patients in current data assigned to control
+  int<lower=0,upper=ntrt> ytrt;         // number of responders in current data assigned to treatment
+  int<lower=0,upper=ntrt> yctrl;         // number of responders in current data assigned to control
+  array[ncomp] vector[2] beta_mean;     // mean hyperparameter for each component
+  array[ncomp] cov_matrix[2] beta_cov;  // covariance hyperparameter for each component
+  simplex[ncomp] mixture_weights;       // weights for each mixture component
+}
+transformed data {
+  vector[ncomp] log_mixture_weights = log(mixture_weights);
+}
+parameters {
+  vector[2] beta;    // intercept and treatment effect
+}
+model {
+  vector[ncomp] log_prior_contrib;    // log of contribution to each component
+  // compute log contribution of each component of the mixture prior:
+  //   log(gamma * f(beta)) = log(gamma) + log f(beta)
+  for ( i in 1:ncomp ) {
+    log_prior_contrib[i] = log_mixture_weights[i] + multi_normal_lpdf(beta | beta_mean[i], beta_cov[i]);
+  }
+  target += log_sum_exp(log_prior_contrib);   // mixture prior
+  
+  // likelihood
+  ytrt ~ binomial_logit(ntrt, sum(beta));
+  yctrl ~ binomial_logit(nctrl, beta[1]);
+}
+generated quantities {
+  real theta1 = inv_logit(sum(beta));
+  real theta0 = inv_logit(beta[1]);
+  real risk_difference = theta1 - theta0;
+  real risk_ratio = theta1 * inv(theta0);
+  real odds_ratio = (theta1 * inv(1 - theta1)) * inv( theta0 * inv(1 - theta0) );
+}
+```
+
+### Inputting the data
+
+We begin by inputting the data of the three trials.
+
+```{r, message = FALSE, warning = FALSE}
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(tidyverse)
+library(abind)
+
+ntrt  <- c(53, 273, 290)
+nctrl <- c(39, 275, 287)
+ytrt  <- c(28, 118, 167)
+yctrl <- c(17, 93, 125)
+study <- c('pluto', 'bliss-52', 'bliss-76')
+data  <- data.frame(study, n.trt = ntrt, n.ctrl = nctrl, y.trt = ytrt, y.ctrl = yctrl)
+data
+datalist <- lapply(
+  1:3, function(i) {
+    data.frame(
+      'n' = c(data[i, 'n.trt'], data[i, 'n.ctrl'])
+      , 'y' = c(data[i, 'y.trt'], data[i, 'y.ctrl'])
+      , 'trt' = c(1, 0)
+    )
+  }
+)
+names(datalist) <- study
+fitlist <- lapply(2:3, function(i) glm(cbind(y, n-y) ~ trt, family = 'binomial', data = datalist[[i]]))
+names(fitlist) <- study[2:3]
+lapply(fitlist, summary)
+```
+
+#### Construction of Stan Data
+
+We construct the `Stan` data as follows:
+
+```{r}
+## Get hyperparmaeters for normal prior
+prior.means <- sapply(fitlist, coef)
+prior.covs  <- sapply(fitlist, vcov, simplify = 'array')
+prior.means <- cbind(prior.means, 0)
+prior.covs  <- abind(prior.covs, diag(100, 2))
+prior.covs[, , 2]
+
+## Stan array indexing is similar to python--use reticulate package to reshape arrays
+prior.means.stan <- aperm(prior.means, c(2, 1))   ## change 2nd dimension to 1st
+prior.covs.stan  <- aperm(prior.covs, c(3, 1, 2)) ## change 3rd --> 1; 1st --> 2nd
+prior.covs.stan[2, , ]
+
+standata <- list(
+  'ncomp' = 3
+  , 'ntrt' = ntrt[1]
+  , 'nctrl' = nctrl[1]
+  , 'ytrt' = ytrt[1]
+  , 'yctrl' = yctrl[1]
+  , 'beta_mean' = prior.means.stan
+  , 'beta_cov' = prior.covs.stan
+  , 'mixture_weights' = c(0.3, 0.3, 0.4)
+)
+smpl <- rm_model$sample(
+  data = standata, iter_warmup = 2000, iter_sampling = 2500
+  , chains = 4, parallel_chains = 4
+  , refresh = 0
+)
+smpl$summary(
+  variables = c('theta1', 'theta0', 'risk_difference', 'risk_ratio', 'odds_ratio')
+  , 'mean', 'sd', 'q' = ~quantile2(., probs = c(0.025, 0.975))
+  , 'p_gt_0' = ~mean(. > 0), 'p_gt_1' = ~mean(. > 1)
+)
+```

@@ -213,7 +213,7 @@ refprior_smpl <- refprior_mod$sample(
 df.refprior <- refprior_smpl$draws(variables = 'risk_difference', format = 'data.frame')
 df.refprior$prior <- 'refprior'
 df.pp  <- pp_smpl$draws(variables = 'risk_difference', format = 'data.frame')
-df.pp$prior <- 'pp (a0 = 0.2)'
+df.pp$prior <- 'pp (a0 = 0.1)'
 df.pp2 <- pp_smpl2$draws(variables = 'risk_difference', format = 'data.frame')
 df.pp2$prior <- 'pp (a0 = 0.3)'
 df.plot <- rbind(df.pp, df.pp2, df.refprior)

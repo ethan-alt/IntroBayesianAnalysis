@@ -1,0 +1,159 @@
+---
+title: 'PLUTO: Power Prior Example'
+author: "Ethan Alt"
+date: "01/12/2023"
+output: 
+  html_document:
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(cmdstanr)
+check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
+register_knitr_engine(override = FALSE)
+```
+
+
+### Stan code
+Below, we implement the Stan code for the power prior.
+```{cmdstan, output.var="pbpp_model"}
+data {
+  int<lower=0> ntrt;                   // num. treated patients in current data set
+  int<lower=0> nctrl;                  // num. placebo patients in current data set
+  int<lower=0,upper=ntrt> ytrt;        // num. responders in treated group
+  int<lower=0,upper=nctrl> yctrl;      // num. responders in control group
+  int<lower=0> J;                      // num. of historical data sets
+  array[J] int<lower=0> ntrt0;         // num. treated patients in historical data sets
+  array[J] int<lower=0> nctrl0;        // num. placebo patients in historical data sets
+  array[J] int<lower=0> ytrt0;         // num. responders in treated group for historical data sets
+  array[J] int<lower=0> yctrl0;        // num. responders in placebo group for historical data sets
+  array[J] real<lower=0,upper=1> a0;   // discounting parameter 
+  real coef_mean;                      // mean hyperparameter for normal prior on regression coefficients
+  real<lower=0> coef_sd;               // sd hyperparameter for normal prior on regression coefficients
+}
+parameters {
+  real intercept;
+  real trteff;
+  real trteff_hist;
+}
+model {
+  // power priors
+  for ( j in 1:J ) {
+    target += a0[j] * binomial_logit_lpmf(ytrt0[j] | ntrt0[j], intercept + trteff_hist); // power prior for treated in j-th data set
+    target += a0[j] * binomial_logit_lpmf(yctrl0[j] | nctrl0[j], intercept);             // power prior for placebo in j-th data set
+  }
+  intercept ~ normal(coef_mean, coef_sd);
+  trteff ~ normal(coef_mean, coef_sd);
+  trteff_hist ~ normal(coef_mean, coef_sd);
+  
+  // likelihood
+  ytrt ~ binomial_logit(ntrt, intercept + trteff);
+  yctrl ~ binomial_logit(nctrl, intercept);
+}
+generated quantities {
+  real theta1 = inv_logit(intercept + trteff);
+  real theta0 = inv_logit(intercept);
+  real risk_difference = theta1 - theta0;
+  real risk_ratio = theta1 * inv(theta0);  // = theta1 / theta0
+  real odds_ratio = (theta1 * inv(1-theta1)) / (theta0 * inv(1-theta0));
+}
+```
+
+### Setup
+First, we load required libraries
+```{r, message = FALSE, warning = FALSE}
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(tidyverse)
+library(ggthemes)
+```
+
+### Analysis in R
+
+#### Creation of the Stan data
+
+Now, we must tell `stan` what the variables named in the `data{}` block are.
+This is done by creating a named list as follows.
+```{r}
+## Create data set
+standata <- list(
+    'ntrt'   = 53
+  , 'nctrl'  = 39
+  , 'ytrt'   = 28
+  , 'yctrl'  = 17
+  , 'J'      = 2
+  , 'ntrt0'  = c(273, 290)
+  , 'nctrl0' = c(275, 287)
+  , 'ytrt0'  = c(118, 167)
+  , 'yctrl0' = c(93, 125)
+  , 'coef_mean' = 0
+  , 'coef_sd'   = 10
+)
+(n <- with(standata, ntrt + nctrl))
+standata$a0 <- c(0.2, 0.2)
+
+## Conduct MCMC sampling
+pbpp_smpl <- pbpp_model$sample(
+  data = standata, iter_warmup = 2000, iter_sampling = 2500
+  , chains = 4, parallel_chains = 4, refresh = 0
+)
+```
+
+## Posterior summary
+```{r}
+pbpp_smpl$summary(
+  variables = c('intercept', 'trteff', 'trteff_hist', 'risk_difference')
+  , 'mean', 'sd', 'prob_gt_0' = ~mean(. > 0), 'q' = ~quantile2(., probs = c(0.025, 0.975))
+)
+```
+
+### Plots
+The `bayesplot` package provides nice diagnostic plots. 
+
+
+#### Trace plots
+
+```{r}
+pbpp_smpl$draws() %>% mcmc_trace()
+```
+
+
+#### Comparing with reference prior
+
+Here, we compare with the reference prior by setting $a_{0j} = 0$.
+
+
+```{r refprior, message = FALSE, warning = FALSE}
+refprior_standata <- standata
+refprior_standata$a0 <- c(0, 0)
+refprior_smpl <- pbpp_model$sample(
+  data = refprior_standata, chains = 4, parallel_chains = 4, iter_warmup = 2000
+  , iter_sampling = 2500, refresh = 0
+)
+
+refprior_smpl$summary(
+  variables = c('intercept', 'trteff', 'trteff_hist', 'risk_difference')
+  , 'mean', 'sd', 'prob_gt_0' = ~mean(. > 0), 'q' = ~quantile2(., probs = c(0.025, 0.975))
+)
+```
+
+
+```{r plot}
+df.refprior <- refprior_smpl$draws(variables = 'risk_difference', format = 'data.frame')
+df.refprior$prior <- 'refprior'
+df.pbpp  <- pbpp_smpl$draws(variables = 'risk_difference', format = 'data.frame')
+df.pbpp$prior <- 'pbpp (a0 = 0.2)'
+df.plot <- rbind(df.pbpp, df.refprior)
+ggplot(
+  df.plot, aes(x = risk_difference, fill = prior)
+) + 
+  geom_density(alpha = 0.5) + 
+  scale_fill_tableau() + 
+  ggtitle('Posterior densities')
+```
+
+
+

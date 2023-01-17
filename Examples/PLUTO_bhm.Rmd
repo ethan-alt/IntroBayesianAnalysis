@@ -71,6 +71,8 @@ library(cmdstanr)
 library(posterior)
 library(bayesplot)
 library(tidyverse)
+library(ggplot2)
+library(ggthemes)
 ```
 
 #### Creation of the Stan data
@@ -128,4 +130,58 @@ and the histogram combining chains...
 
 ```{r}
 bhm_mcmc %>% mcmc_hist()
+```
+
+
+#### Comparing with a reference prior
+
+We set $\theta_1 \sim U(0, 1)$ and $\theta_0 \sim U(0, 1)$, only using the
+PLUTO trial data.
+
+```{cmdstan, output.var="refprior_mod", message = FALSE}
+data {
+  int<lower=0> ntrt;       // num. treated patients in historical data sets
+  int<lower=0> nctrl;      // num. placebo patients in historical data sets
+  int<lower=0> ytrt;       // num. responders in treated group for historical data sets
+  int<lower=0> yctrl;      // num. responders in placebo group for historical data sets
+}
+parameters {
+  real<lower=0,upper=1> theta1;     // response rate for treated
+  real<lower=0,upper=1> theta0;     // response rate for placebo
+}
+model {
+  ytrt ~ binomial(ntrt, theta1);
+  yctrl ~ binomial(nctrl, theta0);
+}
+generated quantities {
+  real risk_difference = theta1 - theta0;
+  real risk_ratio = theta1 * inv(theta0);  // = theta1 / theta0
+  real odds_ratio = (theta1 * inv(1-theta1)) * inv(theta0 * inv(1-theta0));
+}
+```
+
+
+```{r refprior, message = FALSE, warning = FALSE}
+standata_ref <- standata
+vars <- c('ytrt', 'yctrl', 'ntrt', 'nctrl')
+for ( x in vars )
+  standata_ref[[x]] <- standata_ref[[x]][1]
+refprior_smpl <- refprior_mod$sample(
+  data = standata_ref, chains = 4, parallel_chains = 4, iter_warmup = 2000
+  , iter_sampling = 2500, refresh = 0
+)
+```
+
+```{r plot}
+df.refprior <- refprior_smpl$draws(variables = 'risk_difference', format = 'data.frame')
+df.refprior$prior <- 'refprior'
+df.bhm <- bhm_smpl$draws(variables = 'risk_difference', format = 'data.frame')
+df.bhm$prior <- 'bhm'
+df.plot <- rbind(df.bhm, df.refprior)
+ggplot(
+  df.plot, aes(x = risk_difference, fill = prior)
+) + 
+  geom_density(alpha = 0.5) + 
+  scale_fill_tableau() +
+  ggtitle('Posterior densities')
 ```

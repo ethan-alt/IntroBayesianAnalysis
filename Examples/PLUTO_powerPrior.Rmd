@@ -1,5 +1,5 @@
 ---
-title: 'Example: Power Prior'
+title: 'PLUTO: Power Prior Example'
 author: "Ethan Alt"
 date: "01/12/2023"
 output: 
@@ -18,7 +18,7 @@ register_knitr_engine(override = FALSE)
 
 ### Stan code
 Below, we implement the Stan code for the power prior.
-```{cmdstan, output.var="model"}
+```{cmdstan, output.var="pp_model"}
 data {
   int<lower=0> ntrt;                 // num. treated patients in current data set
   int<lower=0> nctrl;                // num. placebo patients in current data set
@@ -61,7 +61,7 @@ generated quantities {
 In an R session, we would compile the Stan code as follows:
 ```{r, eval = FALSE}
 library(cmdstanr)
-model <- cmdstan_model('path/to/file/filename.stan')
+pp_model <- cmdstan_model('path/to/file/filename.stan')
 ```
 
 
@@ -72,6 +72,7 @@ library(cmdstanr)
 library(posterior)
 library(bayesplot)
 library(tidyverse)
+library(ggthemes)
 ```
 
 ### Analysis in R
@@ -97,7 +98,7 @@ standata <- list(
 standata$a0 <- c(0.1, 0.1)
 
 ## Conduct MCMC sampling
-smpl <- model$sample(
+pp_smpl <- pp_model$sample(
   data = standata, iter_warmup = 2000, iter_sampling = 2500
   , chains = 4, parallel_chains = 4, refresh = 0
 )
@@ -106,19 +107,19 @@ To access the samples, we use the `draws` method, which in turn uses the
 convenient `posterior` package. We will obtain the draws via a special `data.frame`
 called a `draws_df`.
 ```{r}
-mcmc <- smpl$draws(format = 'draws_df')
-mcmc %>% summarize_draws()
+pp_mcmc <- pp_smpl$draws(format = 'draws_df')
+pp_mcmc %>% summarize_draws()
 ```
 
 By default, the `summarize_draws()` method gives $90\%$ credible intervals. To
 obtain a 95\% CI, we can do the following:
 ```{r}
-mcmc %>% summarize_draws(quantile2, .args = list(probs = c(0.025, 0.975)))
+pp_mcmc %>% summarize_draws(quantile2, .args = list(probs = c(0.025, 0.975)))
 ```
 
 More generally, we can summarize different posterior quantities
 ```{r}
-mcmc %>% summarize_draws(
+pp_mcmc %>% summarize_draws(
   'mean', 'sd', ~quantile(.x, probs = c(0.025, 0.975)), 'pgt0' = ~mean(.x > 0), 'pgt1' = ~mean(.x > 1)
 )
 ```
@@ -128,12 +129,12 @@ In this case, the trial would be unsuccessful. Let's see what happens when
 we change $a_{01} = a_{02} = 0.3$
 ```{r}
 standata$a0 <- rep(0.2, 2)
-smpl2 <- model$sample(
+pp_smpl2 <- pp_model$sample(
   data = standata, iter_warmup = 2000, iter_sampling = 2500
   , chains = 4, parallel_chains = 4, refresh = 0
 )
-mcmc2 <- smpl2$draws(format = 'draws_df')
-mcmc2 %>% summarize_draws(
+pp_mcmc2 <- pp_smpl2$draws(format = 'draws_df')
+pp_mcmc2 %>% summarize_draws(
   'mean', 'sd', ~quantile(.x, probs = c(0.025, 0.975)), 'pgt0' = ~mean(.x > 0), 'pgt1' = ~mean(.x > 1)
 )
 ```
@@ -144,20 +145,85 @@ The `bayesplot` package provides nice diagnostic plots.
 
 
 #### Trace plots
+
 Trace plots show how the MCMC converges. Ideally, we want to see lines randomly
 fluctuating.
+
 ```{r}
-mcmc2 %>% mcmc_trace()
+pp_mcmc2 %>% mcmc_trace()
 ```
+
 #### Autocorrelation plots
+
 Autocorrelation can sometimes be problematic as it can indicate that the
 chain is "stuck". 
+
 ```{r}
-mcmc2 %>% mcmc_acf()
+pp_mcmc2 %>% mcmc_acf()
 ```
+
 ### Posterior plots
+
 Oftentimes, it's useful to plot the posterior distribution of each parameter
+
 ```{r}
 ## Posterior histogram
-mcmc2 %>% mcmc_hist()
+pp_mcmc2 %>% mcmc_hist()
 ```
+
+
+
+#### Comparing with reference prior
+
+We set $\theta_1 \sim U(0, 1)$ and $\theta_0 \sim U(0, 1)$, only using the
+PLUTO trial data.
+
+```{cmdstan, output.var="refprior_mod", message = FALSE}
+data {
+  int<lower=0> ntrt;       // num. treated patients in historical data sets
+  int<lower=0> nctrl;      // num. placebo patients in historical data sets
+  int<lower=0> ytrt;       // num. responders in treated group for historical data sets
+  int<lower=0> yctrl;      // num. responders in placebo group for historical data sets
+}
+parameters {
+  real<lower=0,upper=1> theta1;     // response rate for treated
+  real<lower=0,upper=1> theta0;     // response rate for placebo
+}
+model {
+  ytrt ~ binomial(ntrt, theta1);
+  yctrl ~ binomial(nctrl, theta0);
+}
+generated quantities {
+  real risk_difference = theta1 - theta0;
+  real risk_ratio = theta1 * inv(theta0);  // = theta1 / theta0
+  real odds_ratio = (theta1 * inv(1-theta1)) * inv(theta0 * inv(1-theta0));
+}
+```
+
+
+```{r refprior, message = FALSE, warning = FALSE}
+refprior_smpl <- refprior_mod$sample(
+  data = standata, chains = 4, parallel_chains = 4, iter_warmup = 2000
+  , iter_sampling = 2500, refresh = 0
+)
+```
+
+
+```{r plot}
+df.refprior <- refprior_smpl$draws(variables = 'risk_difference', format = 'data.frame')
+df.refprior$prior <- 'refprior'
+df.pp  <- pp_smpl$draws(variables = 'risk_difference', format = 'data.frame')
+df.pp$prior <- 'pp (a0 = 0.2)'
+df.pp2 <- pp_smpl2$draws(variables = 'risk_difference', format = 'data.frame')
+df.pp2$prior <- 'pp (a0 = 0.3)'
+df.plot <- rbind(df.pp, df.pp2, df.refprior)
+ggplot(
+  df.plot, aes(x = risk_difference, fill = prior)
+) + 
+  geom_density(alpha = 0.5) + 
+  scale_fill_tableau() + 
+  ggtitle('Posterior densities')
+```
+
+
+

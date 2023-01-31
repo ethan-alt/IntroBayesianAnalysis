@@ -1,5 +1,5 @@
 ---
-title: 'ESTEEM Study: Latent Exchangeability Prior (LEAP)'
+title: 'ESTEEM Study: Hierarchical Prediction Prior (HPP)'
 author: "Ethan Alt"
 date: "2023-01-26"
 output: 

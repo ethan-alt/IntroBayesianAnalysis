@@ -13,7 +13,7 @@
 
 <meta name="date" content="2023-01-24" />
 
-<title>ESTEEM Study: Partial Borrowing Power Prior (strapp)</title>
+<title>ESTEEM Study: Scale-Transformed Power Prior (straPP)</title>
 
 <script>// Pandoc 2.9 adds attributes on both header and div. We remove the former (to
 // be compatible with the behavior of Pandoc < 2.8).
@@ -651,8 +651,8 @@ display: none;
 
 
 
-<h1 class="title toc-ignore">ESTEEM Study: Partial Borrowing Power Prior
-(strapp)</h1>
+<h1 class="title toc-ignore">ESTEEM Study: Scale-Transformed Power Prior
+(straPP)</h1>
 <h4 class="author">Ethan Alt</h4>
 <h4 class="date">2023-01-24</h4>
 
@@ -845,14 +845,14 @@ to perform MCMC.</p>
 <span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
 <pre><code>## Running MCMC with 4 parallel chains...
 ## 
-## Chain 3 finished in 10.4 seconds.
-## Chain 4 finished in 10.4 seconds.
-## Chain 1 finished in 10.7 seconds.
-## Chain 2 finished in 10.8 seconds.
+## Chain 3 finished in 9.9 seconds.
+## Chain 4 finished in 9.9 seconds.
+## Chain 1 finished in 10.2 seconds.
+## Chain 2 finished in 10.3 seconds.
 ## 
 ## All 4 chains finished successfully.
-## Mean chain execution time: 10.5 seconds.
-## Total execution time: 10.9 seconds.</code></pre>
+## Mean chain execution time: 10.1 seconds.
+## Total execution time: 10.4 seconds.</code></pre>
 <div class="sourceCode" id="cb12"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a>strapp_smpl<span class="sc">$</span><span class="fu">summary</span>(</span>
 <span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">variables =</span> <span class="cn">NULL</span>, mean, sd, <span class="st">&#39;q&#39;</span> <span class="ot">=</span> <span class="er">~</span><span class="fu">quantile2</span>(.x, <span class="at">probs =</span> <span class="fu">c</span>(<span class="fl">0.025</span>, <span class="fl">0.975</span>))</span>
 <span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>  , <span class="st">&#39;pr_lt_0&#39;</span> <span class="ot">=</span> <span class="er">~</span><span class="fu">mean</span>(.x <span class="sc">&lt;</span> <span class="dv">0</span>)</span>
@@ -1258,14 +1258,14 @@ the <code>standata</code>.</p>
 <span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
 <pre><code>## Running MCMC with 4 parallel chains...
 ## 
-## Chain 2 finished in 11.5 seconds.
-## Chain 3 finished in 11.7 seconds.
-## Chain 1 finished in 11.8 seconds.
-## Chain 4 finished in 12.5 seconds.
+## Chain 2 finished in 11.1 seconds.
+## Chain 3 finished in 11.2 seconds.
+## Chain 1 finished in 11.4 seconds.
+## Chain 4 finished in 12.1 seconds.
 ## 
 ## All 4 chains finished successfully.
-## Mean chain execution time: 11.9 seconds.
-## Total execution time: 12.7 seconds.</code></pre>
+## Mean chain execution time: 11.4 seconds.
+## Total execution time: 12.2 seconds.</code></pre>
 <div class="sourceCode" id="cb16"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a>genstrapp_smpl<span class="sc">$</span><span class="fu">summary</span>(</span>
 <span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">variables =</span> <span class="cn">NULL</span>, mean, sd, <span class="st">&#39;q&#39;</span> <span class="ot">=</span> <span class="er">~</span><span class="fu">quantile2</span>(.x, <span class="at">probs =</span> <span class="fu">c</span>(<span class="fl">0.025</span>, <span class="fl">0.975</span>))</span>
 <span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>  , <span class="st">&#39;pr_lt_0&#39;</span> <span class="ot">=</span> <span class="er">~</span><span class="fu">mean</span>(.x <span class="sc">&lt;</span> <span class="dv">0</span>)</span>
@@ -1840,14 +1840,14 @@ beta[7]
 <span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
 <pre><code>## Running MCMC with 4 parallel chains...
 ## 
-## Chain 1 finished in 0.4 seconds.
-## Chain 2 finished in 0.4 seconds.
-## Chain 3 finished in 0.4 seconds.
-## Chain 4 finished in 0.4 seconds.
+## Chain 1 finished in 0.3 seconds.
+## Chain 2 finished in 0.3 seconds.
+## Chain 3 finished in 0.3 seconds.
+## Chain 4 finished in 0.3 seconds.
 ## 
 ## All 4 chains finished successfully.
-## Mean chain execution time: 0.4 seconds.
-## Total execution time: 0.5 seconds.</code></pre>
+## Mean chain execution time: 0.3 seconds.
+## Total execution time: 0.4 seconds.</code></pre>
 </div>
 </div>
 <div id="comparison-between-strapp-and-refernce-prior" class="section level3">

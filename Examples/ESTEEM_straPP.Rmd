@@ -1,5 +1,5 @@
 ---
-title: 'ESTEEM Study: Partial Borrowing Power Prior (strapp)'
+title: 'ESTEEM Study: Scale-Transformed Power Prior (straPP)'
 author: "Ethan Alt"
 date: "2023-01-24"
 output: 

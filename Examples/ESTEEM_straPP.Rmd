@@ -76,6 +76,7 @@ parameters {
   vector[p-1] gamma;      // treatment effect and covariates for binary data
   // conditional parameters
   vector[(genstrapp == 1) ? p-1 : 0] c0;
+  vector<lower=0,upper=1>[(genstrapp == 1) ? 1 : 0] c0_sd;
 }
 transformed parameters {
   // don't borrow intercept
@@ -91,8 +92,10 @@ model {
   intercept_hist ~ normal(gamma_mean, gamma_sd);
   gamma ~ normal(gamma_mean, gamma_sd);
   sigma ~ cauchy(0, 1);
-  if (genstrapp == 1)
-    c0 ~ std_normal();
+  if (genstrapp == 1) {
+    c0 ~ normal(0, c0_sd[1]);
+    c0_sd ~ std_normal();
+  }
   
   // Power prior (discounted likelihood of historical (binary) data)
   target += a0 * bernoulli_logit_glm_lpmf(y0 | X0tilde, intercept_hist, gamma);
@@ -211,6 +214,9 @@ genstrapp_smpl$summary(
   , 'pr_lt_0' = ~mean(.x < 0)
 ) %>% kable(digits = 3) %>%
   kable_styling(bootstrap_options = c("striped", "hover"))
+
+
+genstrapp_smpl$draws() %>% mcmc_trace()
 ```
 
 

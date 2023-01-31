@@ -1,0 +1,272 @@
+---
+title: 'ESTEEM Study: Latent Exchangeability Prior (LEAP)'
+author: "Ethan Alt"
+date: "2023-01-26"
+output: 
+  html_document:
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+set.seed(123)
+knitr::opts_chunk$set(echo = TRUE)
+library(cmdstanr)
+check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
+register_knitr_engine(override = FALSE)
+```
+
+## Stan implementation of HPP
+
+We now write the Stan code for the HPP prior. We assume a logistic regression 
+model where we only possess summary statistics from the historical study.
+
+We store the model in an object called `hpp_model`.
+
+```{cmdstan, output.var="hpp_model", message=FALSE}
+functions {
+  real logistic_glm_conjugate_lpdf(vector beta, vector m, matrix X, real lambda) {
+    int n = rows(X);
+    vector[n] eta = X*beta;
+    return lambda * sum( m .* eta - log(1 + exp(eta)) );
+  }
+  vector logistic_glm_conjugate_irls(vector m, matrix X, int max_iter, real thresh) {
+    int n = rows(X);
+    int p = cols(X);
+    vector[p] betahat;      // current iteration
+    vector[p] betahat_old;  // previous iteration
+    vector[n] mu;           // mean = inv_logit(X * betahat)
+    vector[n] v;            // variance function
+    vector[n] eta;          // linear predictor
+    vector[n] z;            // pseudo-observation
+    real delta = 1e6;       // initialize norm of betahat - betahat_old
+    
+    // Initialize betahat
+    betahat = rep_vector(0, p);
+    for ( i in 1:max_iter ) {
+      // Store curren value of beta hat
+      betahat_old = betahat;
+      // Compute linear predictor, mean, variance function, and pseudo observation
+      eta = X * betahat;
+      mu  = inv_logit(eta);
+      v   = mu .* (1 - mu);
+      z   = eta + (m - mu) .* inv(v);
+      // Obtain MLE using weighted least squares
+      betahat = mdivide_left_spd( X' * diag_pre_multiply(v, X), X' * (v .* z) );
+      // Compute convergence criteria
+      delta = dot_self(betahat - betahat_old);
+      if ( delta <= thresh )
+        return(betahat);
+    }
+    print("Warning: maximum iterations reached");
+    return betahat; 
+  }
+  matrix logistic_glm_conjugate_neghessian(vector betahat, matrix X, real lambda) {
+    int n = rows(X);
+    int p = cols(X);
+    vector[n] w = inv_logit(X * betahat);   // initialize to mean
+    w = w .* (1 - w);
+    return lambda * ( X' * diag_pre_multiply(w, X) );
+  }
+  real logistic_glm_conjugate_lognc(vector m, matrix X, real lambda, int max_iter, real thresh) {
+    real log_2pi = 1.83787706640934548356065947281;
+    int p = cols(X);
+    vector[p] betahat = logistic_glm_conjugate_irls(m, X, max_iter, thresh);
+    matrix[p,p] neghessian = logistic_glm_conjugate_neghessian(betahat, X, lambda);
+    real log_det_neghessian = log_determinant_spd(neghessian);
+    // return laplace approximation to log of normalizing constant
+    return   logistic_glm_conjugate_lpdf(betahat | m, X, lambda)
+           + 0.5 * ( p * log_2pi - log_det_neghessian );
+  }
+}
+data {
+  int<lower=0> n;                    // current data sample size
+  int<lower=0> p;                    // number of covariates (excl. intercept and treatment effect)
+  array[n] int<lower=0,upper=1> y;   // current data outcomes (binary)
+  matrix[n,p] X;                     // design matrix of current data (incl intercept and trt)
+  vector[p] betahat0;                // MLE of historical data set
+  cov_matrix[p] vcov0;               // variance-covariance matrix of historical MLE
+  real<lower=0,upper=1> lambda;      // discounting parameter
+  int<lower=0> max_iter;
+  real<lower=0> thresh;
+}
+transformed data {
+  vector[n] mu0 = inv_logit(X * betahat0);
+  vector[n] var0;
+  vector[n] shape1;
+  vector[n] shape2;
+  // Obtain variance via delta method
+  for ( i in 1:n ) {
+    var0[i] = square(mu0[i] * (1 - mu0[i])) * X[i, ] * vcov0 * (X[i, ]');
+  }
+  // Obtain parameters for HPP: beta(shape1, shape2) where shape1, shape2 solve 
+  //    mu = shape1 / (shape1 + shape2)
+  //    var = (shape1 * shape2) / ( (shape1 + shape2)^2 * (shape1 + shape2 + 1) );
+  shape1 = mu0 .* ( mu0 .* (1 - mu0) .* inv(var0) - 1 );
+  shape2 = shape1 .* (inv(mu0) - 1);
+}
+parameters {
+  vector[p] beta;
+  vector<lower=0,upper=1>[n] m;
+}
+model {
+  // Chen-Ibrahin conjugate prior
+  target += logistic_glm_conjugate_lpdf(beta | m, X, lambda);
+  // Subtract off log of normalizing constant (via laplace approximation)
+  target += -logistic_glm_conjugate_lognc(m, X, lambda, max_iter, thresh);
+  // hierarchical prediction prior
+  m ~ beta(shape1, shape2);
+  
+  // likelihood
+  y ~ bernoulli_logit_glm(X, 0, beta);
+}
+```
+
+## R code for analysis
+
+### Obtaining the data
+
+We can obtain the data directly from GitHub.
+
+```{r data, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(cmdstanr)
+library(bayesplot)
+library(posterior)
+library(ggthemes)
+library(kableExtra)
+library(broom)
+
+
+url <- 'https://raw.githubusercontent.com/ethan-alt/IntroBayesianAnalysis/main/Data'
+esteem1 <- read.csv(file.path(url, 'esteem1.csv'))
+esteem2 <- read.csv(file.path(url, 'esteem2.csv'))
+
+## Keep only full data
+esteem1 <- esteem1[complete.cases(esteem1), ]
+esteem2 <- esteem2[complete.cases(esteem2), ]
+
+## Declare placebo as reference group
+esteem1$treatment <- factor(esteem1$treatment, levels = c('Placebo', '30 mg BID'))
+esteem2$treatment <- factor(esteem2$treatment, levels = c('Placebo', '30 mg BID'))
+
+## Create binary outcome
+esteem1$pasi_resp <- with(esteem1, ifelse(pasi_pchg <= -75, 1, 0))
+esteem2$pasi_resp <- with(esteem2, ifelse(pasi_pchg <= -75, 1, 0))
+
+## Show table of current / historical data
+with(esteem1, table(treatment, pasi_resp)) %>% kable() %>% 
+  kable_classic(full_width = FALSE, bootstrap_options = c("striped", "hover")) %>%
+  add_header_above(c(' ', 'Responders' = 2)) %>%
+  pack_rows('Treatment', 1, 2)
+with(esteem2, table(treatment, pasi_resp)) %>% kable() %>% 
+  kable_classic(full_width = FALSE, bootstrap_options = c("striped", "hover")) %>%
+  add_header_above(c(' ', 'Responders' = 2)) %>%
+  pack_rows('Treatment', 1, 2)
+```
+
+
+### Constructing the Stan data
+
+We now construct the Stan data.
+
+```{r standata}
+formula <- pasi_resp ~ treatment + scale(pasi_bsl) + scale(age) + I(scale(age)^2) + smoke + prior_sys
+
+## Fit historical data MLE--pretend we don't observe historical data
+hist.fit <- glm(formula, family = 'binomial', data = esteem1)
+hist.fit %>% tidy() %>% kable(digits = 3) %>% kable_classic(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+
+## Get sample sizes --> compute lambda
+(n0 <- nrow(esteem1))
+(n  <- nrow(esteem2))
+lambda <- 0.5 * min(n / n0, 1)
+
+standata <- list(
+  'y' = esteem2[, all.vars(formula)[1]]
+  , 'X' = model.matrix(formula, esteem2)
+  , 'betahat0' = coef(hist.fit)
+  , 'vcov0'    = vcov(hist.fit)
+  , 'lambda'   = lambda
+  , 'max_iter' = 100
+  , 'thresh'   = 1e-6
+)
+standata$n  <- nrow(standata$X)
+standata$n0 <- nrow(standata$X0)
+standata$p  <- ncol(standata$X)
+```
+
+
+### Performing the MCMC sampling and conducting the analysis
+
+We call the `sample()` method from `cmdstanr` to perform MCMC.
+
+```{r mcmc, message = F, warning = F}
+hpp_smpl <- 
+  hpp_model$sample(
+  data = standata
+  , iter_warmup = 1000, iter_sampling = 2500, parallel_chains = 4
+  , refresh = 0
+)
+```
+
+
+```{r summary}
+hpp_smpl$summary(
+  variables = paste0('beta[', 1:ncol(standata$X), ']'), mean, sd, 'q' = ~quantile2(.x, probs = c(0.025, 0.975))
+) %>% kable(digits = 4) %>% kable_classic(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+```
+
+
+### Comparison to a reference prior (no borrowing)
+
+We can compare to an improper uniform prior.
+
+```{cmdstan output.var = 'ref_model'}
+data {
+  int<lower=0> n;                    // current data sample size
+  int<lower=0> p;                    // number of covariates (excl. intercept and treatment effect)
+  array[n] int<lower=0,upper=1> y;   // current data outcomes (binary)
+  matrix[n,p] X;                     // design matrix of current data (incl intercept and trt)
+}
+parameters {
+  vector[p] beta;
+}
+model {
+  // likelihood
+  y ~ bernoulli_logit_glm(X, 0, beta);
+}
+```
+
+#### R code for analysis with reference prior
+
+```{r refprior}
+ref_smpl <- suppressMessages(
+  ref_model$sample(
+    data = standata, iter_warmup = 2000, iter_sampling = 2500
+    , parallel_chains = 4, refresh = 1000
+  )
+)
+```
+### Comparison between straPP and refernce prior
+
+We plot the posterior densities of the treatment effect for each prior.
+
+```{r}
+draws.hpp  <- hpp_smpl$draws(format = 'data.frame') %>% select(starts_with('beta'))
+draws.ref <- ref_smpl$draws(format = 'data.frame') %>% select(starts_with('beta'))
+draws.hpp$Prior  <- 'HPP'
+draws.ref$Prior <- 'Reference'
+plot.df <- rbind(draws.hpp, draws.ref)
+
+ggplot(
+  plot.df, aes(x = .data[['beta[2]']], color = Prior, fill = Prior)
+) +
+  geom_density(alpha = 0.5) +
+  scale_color_tableau() +
+  scale_fill_tableau()
+
+```
+
+
+

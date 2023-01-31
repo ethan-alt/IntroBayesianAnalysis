@@ -1,0 +1,286 @@
+---
+title: 'ESTEEM Study: Partial Borrowing Power Prior (strapp)'
+author: "Ethan Alt"
+date: "2023-01-24"
+output: 
+  html_document:
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+set.seed(123)
+knitr::opts_chunk$set(echo = TRUE)
+library(cmdstanr)
+check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
+register_knitr_engine(override = FALSE)
+```
+
+## Stan implementation of strapp
+
+We now write the Stan code for the strapp. We assume a normal linear model where
+we wish only to borrow from the intercept and covariates.
+
+We store the model in an object called `strapp_model`.
+
+```{cmdstan, output.var="strapp_model", message=FALSE}
+functions {
+  matrix sqrt_matrix(matrix A) {
+    int p = rows(A);
+    vector[p] eigvals   = eigenvalues_sym(A);
+    matrix[p,p] eigvecs = eigenvectors_sym(A);
+    return diag_post_multiply(eigvecs, sqrt(eigvals)) * eigvecs'; 
+  }
+  matrix fisher_logistic(vector gamma, matrix X) {
+    int n = rows(X);
+    int p = cols(X);
+    vector[n] prob = inv_logit(X * gamma);
+    vector[n] w    = prob .* (1 - prob); // .* = element-wise multiplication
+    return X' * diag_pre_multiply(w, X);
+  }
+  vector strapp_transform(
+     real sigma, vector gamma, matrix X, matrix invsqrt_XtX, vector c0
+  ) {
+    int n = rows(X);
+    int p = cols(X);
+    matrix[p,p] invsqrt_fisher_normal = sigma * invsqrt_XtX;
+    matrix[p,p] sqrt_fisher_logistic = sqrt_matrix(fisher_logistic(gamma, X));
+    return invsqrt_fisher_normal * (sqrt_fisher_logistic * gamma + c0);
+  }
+}
+data {
+  int<lower=0> n;                    // current data sample size
+  int<lower=0> n0;                   // historical data sample size
+  int<lower=0> p;                    // number of covariates (incl. intercept and trteff)
+  vector[n] y;                       // current data outcomes (continuous)
+  array[n0] int<lower=0,upper=1> y0; // historical data outcomes (binary)
+  matrix[n,p] X;                     // design matrix of current data (incl intercept and trt)
+  matrix[n0,p] X0;                   // design matrix of historical data (incl intercept and trt)
+  real<lower=0,upper=1> a0;          // discounting parameter
+  real gamma_mean;                   // mean hyperparameter for initial prior on gamma
+  real<lower=0> gamma_sd;            // sd hyperparameter for initial prior on bgamma
+  real intercept_mean;               // mean hyperparameter for normal prior on current data intercept
+  real<lower=0> intercept_sd;        // sd hyperparameter for normal prior on current data intercept
+  int<lower=0,upper=1> genstrapp;    // whether to do strapp (= 0) or genstrapp (=1)
+}
+transformed data {
+  matrix[n,p-1] Xtilde = X[, 2:p];
+  matrix[n0,p-1] X0tilde = X0[, 2:p];
+  matrix[p-1,p-1] invsqrt_X0tX0 = inverse_spd( sqrt_matrix( crossprod( X0tilde ) ) );  // (X0'X0)^(-1/2)
+  vector[p-1] c0_const = rep_vector(0, p-1);
+}
+parameters {
+  real intercept;         // intercept for current data
+  real intercept_hist;    // intercept for historical data (not borrowed)
+  real<lower=0> sigma;    // SD parameter
+  vector[p-1] gamma;      // treatment effect and covariates for binary data
+  // conditional parameters
+  vector[(genstrapp == 1) ? p-1 : 0] c0;
+}
+transformed parameters {
+  // don't borrow intercept
+  vector[p-1] beta;
+  if (genstrapp == 1)
+    beta = strapp_transform(sigma, gamma, X0tilde, invsqrt_X0tX0, c0);
+  else
+    beta = strapp_transform(sigma, gamma, X0tilde, invsqrt_X0tX0, c0_const);
+}
+model {
+  // Initial prior
+  intercept ~ normal(intercept_mean, intercept_sd);
+  intercept_hist ~ normal(gamma_mean, gamma_sd);
+  gamma ~ normal(gamma_mean, gamma_sd);
+  sigma ~ cauchy(0, 1);
+  if (genstrapp == 1)
+    c0 ~ std_normal();
+  
+  // Power prior (discounted likelihood of historical (binary) data)
+  target += a0 * bernoulli_logit_glm_lpmf(y0 | X0tilde, intercept_hist, gamma);
+  
+  // Likelihood
+  y ~ normal_id_glm(Xtilde, intercept, beta, sigma);
+}
+```
+
+## R code for analysis
+
+### Obtaining the data
+
+We can obtain the data directly from GitHub.
+
+```{r data, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(cmdstanr)
+library(bayesplot)
+library(posterior)
+library(ggthemes)
+library(kableExtra)
+
+
+url <- 'https://raw.githubusercontent.com/ethan-alt/IntroBayesianAnalysis/main/Data'
+esteem1 <- read.csv(file.path(url, 'esteem1.csv'))
+esteem2 <- read.csv(file.path(url, 'esteem2.csv'))
+
+## Keep only full data
+esteem1 <- esteem1[complete.cases(esteem1), ]
+esteem2 <- esteem2[complete.cases(esteem2), ]
+
+## Create binary outcome for esteem1 (pretend we don't have continuous)
+esteem1$pasi_pchg_nonresp <- ifelse(esteem1$pasi_pchg > -75, 1, 0)
+
+## Table showing responders
+table(esteem1$treatment, esteem1$pasi_pchg_nonresp)
+
+## Declare placebo as reference group
+esteem1$treatment <- factor(esteem1$treatment, levels = c('Placebo', '30 mg BID'))
+esteem2$treatment <- factor(esteem2$treatment, levels = c('Placebo', '30 mg BID'))
+
+## First few lines of esteem1
+head(esteem1)
+
+## First few lines of esteem2
+head(esteem2)
+```
+
+
+### Constructing the Stan data
+
+We now construct the Stan data.
+
+```{r standata}
+formula.cur <- pasi_pchg ~ treatment + scale(pasi_bsl) + scale(age) + I(scale(age)^2) + smoke + prior_sys
+formula.hist <- pasi_pchg_nonresp ~ treatment + scale(pasi_bsl) + scale(age) + I(scale(age)^2) + smoke + prior_sys
+
+
+standata <- list(
+  'y' = esteem2[, all.vars(formula.cur)[1]]
+  , 'X' = model.matrix(formula.cur, esteem2)
+  , 'y0' = esteem1[, all.vars(formula.hist)[1]]
+  , 'X0' = model.matrix(formula.hist, esteem1)
+  , 'gamma_mean' = 0
+  , 'gamma_sd' = 10
+  , 'intercept_mean' = 0
+  , 'intercept_sd' = 10
+  , 'genstrapp' = 0
+)
+standata$n  <- nrow(standata$X)
+standata$n0 <- nrow(standata$X0)
+standata$p  <- ncol(standata$X)
+(standata$a0 <- min(1, standata$n / standata$n0))
+```
+
+
+### Performing the MCMC sampling and conducting the analysis
+
+We call the `sample()` method from `cmdstanr` to perform MCMC.
+
+```{r mcmc, warning = FALSE, message = FALSE}
+strapp_smpl <- suppressMessages(
+  strapp_model$sample(
+  data = standata, iter_warmup = 2000, iter_sampling = 4000, parallel_chains = 4
+  , refresh = 0
+)
+)
+strapp_smpl$summary(
+  variables = NULL, mean, sd, 'q' = ~quantile2(.x, probs = c(0.025, 0.975))
+  , 'pr_lt_0' = ~mean(.x < 0)
+) %>% kable(digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+
+
+```{r diagnostics}
+strapp_draws <- strapp_smpl$draws(format = 'draws_df')
+strapp_draws %>% mcmc_trace()
+```
+
+
+To do the gen-straPP, we replace `genstrapp <- 1` in the `standata`.
+
+```{r genstrapp}
+standata$genstrapp <- 1
+genstrapp_smpl <- suppressMessages(
+  strapp_model$sample(
+  data = standata, iter_warmup = 2000, iter_sampling = 4000, parallel_chains = 4
+  , refresh = 0
+)
+)
+genstrapp_smpl$summary(
+  variables = NULL, mean, sd, 'q' = ~quantile2(.x, probs = c(0.025, 0.975))
+  , 'pr_lt_0' = ~mean(.x < 0)
+) %>% kable(digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+
+### Comparison to a reference prior (no borrowing)
+
+#### Stan code
+
+We implement code that does no borrowing and assumes 
+$\beta_j \sim N(0, 10^2)$ a priori
+and $\sigma \sim \text{Half-Cauchy}(0, 1)$ a priori.
+
+```{cmdstan, output.var="ref_model", message=FALSE}
+data {
+  int<lower=0> n;                    // current data sample size
+  int<lower=0> n0;                   // historical data sample size
+  int<lower=0> p;                    // number of covariates (incl. intercept and trteff)
+  vector[n] y;                       // current data outcomes (continuous)
+  matrix[n,p] X;                     // design matrix of current data (incl intercept and trt)
+}
+transformed data {
+  matrix[n,p-1] Xtilde = X[, 2:p];
+}
+parameters {
+  real intercept;         // intercept for current data
+  vector[p-1] beta;       // regression coefficients
+  real<lower=0> sigma;    // SD parameter
+}
+model {
+  // Initial prior
+  intercept ~ normal(0, 10);
+  beta ~ normal(0, 10);
+  sigma ~ cauchy(0, 1);
+  
+  // Likelihood
+  y ~ normal_id_glm(Xtilde, intercept, beta, sigma);
+}
+```
+
+#### R code for analysis with reference prior
+
+```{r refprior}
+ref_smpl <- suppressMessages(
+  ref_model$sample(
+    data = standata, iter_warmup = 2000, iter_sampling = 2500
+    , parallel_chains = 4, refresh = 0
+  )
+)
+```
+### Comparison between straPP and refernce prior
+
+We plot the posterior densities of the treatment effect for each prior.
+
+```{r}
+trteff.strapp <- strapp_smpl$draws(variables = 'beta[1]', format = 'data.frame')
+trteff.genstrapp <- genstrapp_smpl$draws(variables = 'beta[1]', format = 'data.frame')
+trteff.ref <- ref_smpl$draws(variables = 'beta[1]', format = 'data.frame')
+
+trteff.strapp$Prior <- 'straPP (a0 = 0.48)'
+trteff.genstrapp$Prior <- 'gen-straPP (a0 = 0.48)'
+trteff.ref$Prior <- 'Reference'
+plot.df <- rbind(trteff.ref, trteff.strapp, trteff.genstrapp) %>% rename('trteff' = 'beta[1]')
+
+ggplot(
+  plot.df, aes(x = trteff, color = Prior, fill = Prior)
+) +
+  geom_density(alpha = 0.5) +
+  scale_color_tableau() + 
+  scale_fill_tableau()
+
+```
+
+
+

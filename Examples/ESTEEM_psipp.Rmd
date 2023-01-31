@@ -1,0 +1,354 @@
+---
+title: 'ESTEEM Study: Propensity Score Integrated Power Prior (PSIPP)'
+author: "Ethan Alt"
+date: "2023-01-25"
+output: 
+  html_document:
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+set.seed(123)
+knitr::opts_chunk$set(echo = TRUE)
+library(cmdstanr)
+check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
+register_knitr_engine(override = FALSE)
+options(knitr.table.format = "html")
+```
+
+## Stan implementation of psipp
+
+We now write the Stan code for the PSIPP We assume a normal linear model where
+we wish only to borrow from the historical controls.
+
+We store the model in an object called `psipp_model`.
+
+```{cmdstan, output.var="psipp_model", message=FALSE}
+data {
+  int<lower=0> n;                                 // current data sample size
+  int<lower=0> n0;                                // historical data sample size
+  int<lower=0> nstrata;                           // number of strata
+  vector[n] y;                                    // current data outcomes
+  vector[n0] y0;                                  // historical data outcomes
+  array[n] int<lower=0,upper=1> trt;              // treatment assignment for current data
+  array[n] int<lower=1,upper=nstrata> stratum;    // stratum assignment for current data
+  array[n0] int<lower=1,upper=nstrata> stratum0;  // stratum assignment for historical data
+  vector<lower=0,upper=1>[nstrata] a0;            // power prior parameters
+  real mu_mean;                                   // mean hyperparameter for normal prior on mean
+  real<lower=0> mu_sd;                            // SD hyperparameter for normal prior on mean
+}
+transformed data { 
+  array[n] int trtindx;   // (1 = placebo; 2 = treatment)
+  for ( i in 1:n ) {
+    trtindx[i] = trt[i] + 1;
+  }
+}
+parameters {
+  matrix[nstrata, 2] mu;
+  matrix<lower=0>[nstrata, 2] sigma;
+}
+model {
+  // initial priors
+  for ( j in 1:2 ) {
+    mu[, j] ~ normal(mu_mean, mu_sd);
+    sigma[, j] ~ cauchy(0, 1);
+  }
+  
+  // historical data (power prior)
+  for ( i in 1:n0 )
+    target += a0[stratum0[i]] * normal_lpdf(y0[i] | mu[ stratum0[i], 1 ], sigma[ stratum0[i], 1 ]);  // only controls
+  
+  // likelihood
+  for ( i in 1:n )
+    target += normal_lpdf(y[i] | mu[ stratum[i], trtindx[i] ], sigma[ stratum[i], trtindx[i] ]);
+}
+
+generated quantities {
+  vector[nstrata] trteff_stratum = mu[, 2] - mu[, 1];
+  real trteff = mean(trteff_stratum);
+}
+```
+
+## R code for analysis
+
+### Obtaining the data
+
+We can obtain the data directly from GitHub.
+
+```{r data, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(cmdstanr)
+library(bayesplot)
+library(posterior)
+library(ggthemes)
+library(kableExtra)
+library(broom)
+
+
+url <- 'https://raw.githubusercontent.com/ethan-alt/IntroBayesianAnalysis/main/Data'
+esteem1 <- read.csv(file.path(url, 'esteem1.csv'))
+esteem2 <- read.csv(file.path(url, 'esteem2.csv'))
+
+## Keep only full data
+esteem1 <- esteem1[complete.cases(esteem1), ]
+esteem2 <- esteem2[complete.cases(esteem2), ]
+
+## Subset for historical controls
+esteem1.ctrls <- esteem1 %>% filter(treatment == 'Placebo')
+
+## Declare placebo as reference group
+esteem1$treatment <- factor(esteem1$treatment, levels = c('Placebo', '30 mg BID'))
+esteem2$treatment <- factor(esteem2$treatment, levels = c('Placebo', '30 mg BID'))
+
+## First few lines of esteem1
+head(esteem1)
+
+## First few lines of esteem2
+head(esteem2)
+
+## Construct pooled data set
+pooled <- rbind(esteem1, esteem2) %>% mutate(studyid = factor(studyid))
+```
+
+
+### Constructing the Stan data
+
+We now construct the Stan data.
+
+#### Estimating the propensity scores
+
+We use the full data to estimate the propensity scores
+
+```{r ps}
+## Set number of strata
+nstrata <- 5
+
+## Estimate propensity score (PS)
+ps.formula <- studyid ~ scale(pasi_bsl) + scale(age) + I(scale(age)^2) + smoke + prior_sys
+ps.glm     <- glm(ps.formula, family = 'binomial', data = pooled)
+ps.glm %>% tidy() %>% kable(digits = 3) %>% kable_styling()
+
+## Obtain fitted PS for all current data and historical controls
+pooled.histctrls <- pooled %>%
+  mutate(ps = predict(ps.glm, newdata = pooled, type = 'response')) %>% ## PS calculation
+  filter(!( studyid == 1 & treatment == '30 mg BID' ))   ## drop treated historical
+  
+## Create strata based on propensity scores of CURRENT RCT
+##   Note: this code simultaneously "trims" the PS--removes
+##   external subjects whose PS is not in the range of the current.
+breaks <- pooled.histctrls %>% 
+  filter(studyid == 2) %>% 
+  select(ps) %>% 
+  unlist() %>%
+  quantile(probs = seq(0, 1, 1 / nstrata))
+breaks[1] <- 0
+breaks[nstrata+1] <- 1
+
+pooled.histctrls <- pooled.histctrls %>%
+  mutate(stratum = cut(ps, breaks)) %>%   ## define strata. Will be NA if PS not in range of current data
+  na.omit                                 ## trimming step
+
+## Plot propensity scores by study ID
+ggplot(pooled.histctrls, aes(x = ps, color = studyid, fill = studyid)) +
+  geom_density(alpha = 0.5) +
+  scale_color_tableau() + 
+  scale_fill_tableau()
+
+## Plot propensity scores by study ID and stratum
+ggplot(pooled.histctrls, aes(x = ps, color = studyid, fill = studyid)) +
+  geom_density(alpha = 0.5) +
+  scale_color_tableau() + 
+  scale_fill_tableau() +
+  facet_wrap(~stratum)
+```
+
+
+#### Selection of $a_0$
+
+We now determine the $a_{0m}$'s, where $m = 1, \ldots, 5$ indexes the 5 strata.
+
+We first determine the nominal number of historical controls to borrow, 
+$\tilde{n}_{00}$ we desire $\tilde{n_{00} + n_{10}} \approx n_{11}$,
+where $n_{10}$ is the number of controls in the current data set and
+$n_{11}$ is the number of treated in the current data set. Thus,
+we should have
+$$
+  \tilde{n}_{00} = \min\{ n_{00}, n_{11} - n_{10} \}
+$$
+
+```{r nominal patients}
+n11 <- pooled.histctrls %>% filter(studyid == 2, treatment == '30 mg BID') %>% nrow
+n10 <- pooled.histctrls %>% filter(studyid == 2, treatment == 'Placebo') %>% nrow
+n00 <- pooled.histctrls %>% filter(studyid == 1, treatment == 'Placebo') %>% nrow
+ntilde00 <- min(n00, n11 - n10)
+c(n11 = n11, n10 = n10, n00 = n00, ntilde00 = ntilde00)
+```
+
+To compute $a_0$, we first compute the PS overlap for each stratum.
+
+```{r overlap}
+library(overlapping)
+(stratanames <- levels(pooled.histctrls$stratum))
+ps.overlap <- sapply(
+  stratanames, function(s) {
+    ## create temporary data set for stratum
+    df.stratum <- pooled.histctrls %>% 
+      filter(stratum == s) %>% 
+      select(studyid, ps)
+    
+    ## get list of propensity scores between current and historical
+    pslist <- lapply(1:2, function(i) df.stratum$ps[df.stratum$studyid == i] )
+    
+    ## Compute overlap
+    overlap(pslist, plot = FALSE)$OV
+  }
+)
+names(ps.overlap) <- stratanames
+round(ps.overlap, 3)
+
+```
+
+Next, we compute the nominal number of patients to borrow, given as
+
+$$
+  \lambda_{0m} = \min\left\{ \frac{r_m}{\sum_{l=1}^5 r_l} \tilde{n}_{00}, n_{00m} \right\},
+$$
+
+where $n_{00m} = $ number of observations among historical controls assigned to stratum $m$
+
+```{r}
+## Get number of historical controls assigned to each stratum (n00m)
+nstratum.histctrls <- pooled.histctrls %>%
+  filter(studyid == 1) %>%
+  select(stratum) %>%
+  table()
+
+## Get number of current controls assigned ot each stratum (n1m)
+nstratum.curctrls <- pooled.histctrls %>%
+  filter(studyid == 2, treatment == 'Placebo') %>%
+  select(stratum) %>%
+  table()
+
+## Get number of current trteated assigned ot each stratum (n1m)
+nstratum.curtrts <- pooled.histctrls %>%
+  filter(studyid == 2, treatment == '30 mg BID') %>%
+  select(stratum) %>%
+  table()
+
+## Compute a0 based on ntilde00 and overlap
+(w <- ps.overlap / sum(ps.overlap))                ## normalized overlap
+lambda <- pmin( ntilde00 * w, nstratum.histctrls ) ## number of subjects to borrow in each stratum
+sum(lambda)                                        ## total number of borrowed controls from historical data
+
+cbind(
+  'n_00m' = nstratum.histctrls,'lambda_0m' = lambda, 'n_10' = nstratum.curctrls
+  , 'n_10star' = lambda + nstratum.curctrls, 'n11' = nstratum.curtrts
+)
+## Compute power prior parameter
+(a0 <- lambda / as.numeric(nstratum.histctrls))
+
+## Compute total number of controls, treated
+c('ctrls' = n10 + sum(lambda), 'trt' = n11)
+```
+In this case, the total number of borrowed patients is `r sum(lambda)` and
+the nominal number of patients to borrow is `r ntilde00``
+
+
+
+### Constructing the Stan data
+
+We now use the above to construct the Stan data.
+
+```{r standata}
+pooled.histctrls$treatment_n <- ifelse(pooled.histctrls$treatment == 'Placebo', 0, 1)
+standata <- list(
+  'y' = pooled.histctrls %>% filter(studyid == 2) %>% select(pasi_pchg) %>% unlist
+  , 'y0' = pooled.histctrls %>% filter(studyid == 1) %>% select(pasi_pchg) %>% unlist
+  , 'trt' = pooled.histctrls %>% filter(studyid == 2) %>% select(treatment_n) %>% unlist
+  , 'stratum' = pooled.histctrls %>% filter(studyid == 2) %>% select(stratum) %>% unlist %>% as.numeric() 
+  , 'stratum0' = pooled.histctrls %>% filter(studyid == 1) %>% select(stratum) %>% unlist %>% as.numeric()
+  , 'a0'  = a0
+  , 'mu_mean' = 0
+  , 'mu_sd' = 10
+  , 'nstrata' = nstrata
+)
+standata$n <- length(standata$y)
+standata$n0 <- length(standata$y0)
+```
+
+Finally, we may call the MCMC sampler.
+
+```{r mcmc}
+psipp.smpl <- psipp_model$sample(
+  data = standata, iter_warmup = 2000, iter_sampling = 2500, parallel_chains = 4
+  , refresh = 0
+)
+```
+We may summarize the output
+
+```{r summarize}
+psipp.smpl$summary(
+  variables = c('trteff_stratum', 'trteff')
+  , mean, sd, q = ~quantile2(.x, probs = c(0.025, 0.975))
+)
+```
+
+
+### Comparison with reference prior
+
+The code for the reference prior may be expressed as
+
+```{cmdstan output.var="reference_model", message=FALSE}
+data {
+  int<lower=0> n;                                 // current data sample size
+  vector[n] y;                                    // current data outcomes
+  array[n] int<lower=0,upper=1> trt;              // treatment assignment for current data
+  real mu_mean;                                   // mean hyperparameter for normal prior on mean
+  real<lower=0> mu_sd;                            // SD hyperparameter for normal prior on mean
+}
+transformed data { 
+  array[n] int trtindx;   // (1 = placebo; 2 = treatment)
+  for ( i in 1:n ) {
+    trtindx[i] = trt[i] + 1;
+  }
+}
+parameters {
+  vector[2] mu;
+  vector<lower=0>[2] sigma;
+}
+model {
+  // initial priors
+  mu ~ normal(mu_mean, mu_sd);
+  sigma ~ cauchy(0, 1);
+  
+  // likelihood
+  for ( i in 1:n )
+    target += normal_lpdf(y[i] | mu[trtindx[i]], sigma[trtindx[i]] );
+}
+generated quantities {
+  real trteff = mu[2] - mu[1];
+}
+```
+
+
+```{r reference}
+ref.smpl <- reference_model$sample(
+  data = standata, iter_warmup = 2000, iter_sampling = 2500, parallel_chains = 4
+  , refresh = 0
+)
+ref.smpl$summary()
+```
+
+```{r compare_plot}
+df.psipp <- cbind(prior = 'psipp', psipp.smpl$draws('trteff', format = 'data.frame') )
+df.reference <- cbind(prior = 'reference', ref.smpl$draws('trteff', format = 'data.frame') )
+plot.df <- rbind(df.psipp, df.reference)
+ggplot(
+  data = plot.df, aes(x = trteff, color = prior, fill = prior)
+) +
+  geom_density(alpha = 0.5) +
+  scale_color_tableau() + 
+  scale_fill_tableau()
+```
+

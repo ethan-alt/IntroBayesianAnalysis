@@ -1,0 +1,185 @@
+---
+title: 'ESTEEM Study: Conjugate Prior for GLMs (CI Prior)'
+author: "Ethan Alt"
+date: "2023-01-26"
+output: 
+  html_document:
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+set.seed(123)
+knitr::opts_chunk$set(echo = TRUE)
+library(cmdstanr)
+check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
+register_knitr_engine(override = FALSE)
+```
+
+## Stan implementation of CI prior
+
+We now write the Stan code for the CI prior. We assume a logistic regression 
+model where we only possess summary statistics from the historical study.
+
+We store the model in an object called `ci_model`.
+
+```{cmdstan, output.var="ci_model", message=FALSE}
+functions {
+  real logistic_glm_conjugate_lpdf(vector beta, vector mu0, matrix X, real lambda) {
+    int n = rows(X);
+    vector[n] eta = X*beta;
+    return lambda * sum( mu0 .* eta - log(1 + exp(eta)) );
+  }
+}
+data {
+  int<lower=0> n;                    // current data sample size
+  int<lower=0> p;                    // number of covariates (excl. intercept and treatment effect)
+  array[n] int<lower=0,upper=1> y;   // current data outcomes (binary)
+  matrix[n,p] X;                     // design matrix of current data (incl intercept and trt)
+  vector[p] betahat0;                // MLE of historical data set
+  real<lower=0,upper=1> lambda;      // discounting parameter
+}
+transformed data {
+  vector[n] mu0 = inv_logit(X * betahat0);
+}
+parameters {
+  vector[p] beta;    // regression coefficients
+}
+model {
+  // Conjugate prior
+  target += logistic_glm_conjugate_lpdf(beta | mu0, X, lambda);
+  // Likelihood
+  target += bernoulli_logit_glm_lpmf(y | X, 0, beta);
+}
+```
+
+## R code for analysis
+
+### Obtaining the data
+
+We can obtain the data directly from GitHub.
+
+```{r data, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(cmdstanr)
+library(bayesplot)
+library(posterior)
+library(ggthemes)
+library(kableExtra)
+library(broom)
+
+
+url <- 'https://raw.githubusercontent.com/ethan-alt/IntroBayesianAnalysis/main/Data'
+esteem1 <- read.csv(file.path(url, 'esteem1.csv'))
+esteem2 <- read.csv(file.path(url, 'esteem2.csv'))
+
+## Keep only full data
+esteem1 <- esteem1[complete.cases(esteem1), ]
+esteem2 <- esteem2[complete.cases(esteem2), ]
+
+## Declare placebo as reference group
+esteem1$treatment <- factor(esteem1$treatment, levels = c('Placebo', '30 mg BID'))
+esteem2$treatment <- factor(esteem2$treatment, levels = c('Placebo', '30 mg BID'))
+
+## Create binary outcome
+esteem1$pasi_resp <- with(esteem1, ifelse(pasi_pchg <= -75, 1, 0))
+esteem2$pasi_resp <- with(esteem2, ifelse(pasi_pchg <= -75, 1, 0))
+
+## Show table of current / historical data
+with(esteem1, table(treatment, pasi_resp)) %>% kable() %>% 
+  kable_classic(full_width = FALSE) %>%
+  add_header_above(c(' ', 'Responders' = 2)) %>%
+  pack_rows('Treatment', 1, 2)
+with(esteem2, table(treatment, pasi_resp)) %>% kable() %>% 
+  kable_classic(full_width = FALSE) %>%
+  add_header_above(c(' ', 'Responders' = 2)) %>%
+  pack_rows('Treatment', 1, 2)
+```
+
+
+### Constructing the Stan data
+
+We now construct the Stan data.
+
+```{r standata}
+formula <- pasi_resp ~ treatment + scale(pasi_bsl) + scale(age) + I(scale(age)^2) + smoke + prior_sys
+
+## Fit historical data MLE--pretend we don't observe historical data
+hist.fit <- glm(formula, family = 'binomial', data = esteem1)
+hist.fit %>% tidy() %>% kable(digits = 3) %>% kable_classic(full_width = FALSE)
+
+## Get sample sizes --> compute lambda
+(n0 <- nrow(esteem1))
+(n  <- nrow(esteem2))
+lambda <- 0.5 * min(n / n0, 1)
+
+standata <- list(
+  'y' = esteem2[, all.vars(formula)[1]]
+  , 'X' = model.matrix(formula, esteem2)
+  , 'betahat0' = coef(hist.fit)
+  , 'lambda'   = lambda
+)
+standata$n  <- nrow(standata$X)
+standata$n0 <- nrow(standata$X0)
+standata$p  <- ncol(standata$X)
+```
+
+
+### Performing the MCMC sampling and conducting the analysis
+
+We call the `sample()` method from `cmdstanr` to perform MCMC.
+
+```{r mcmc, message = FALSE, warning = FALSE}
+ci_smpl <- 
+  ci_model$sample(
+  data = standata, iter_warmup = 1000, iter_sampling = 2500, parallel_chains = 4
+  , chains = 4, refresh = 0
+)
+```
+
+
+```{r summary}
+ci_smpl$summary(
+  variables = NULL, mean, sd, 'q' = ~quantile2(.x, probs = c(0.025, 0.975))
+) %>% kable(digits = 4) %>% kable_classic(full_width = FALSE)
+```
+
+
+### Comparison to a reference prior (no borrowing)
+
+We can compare to an improper uniform prior by setting $\lambda = 0$.
+
+#### R code for analysis with reference prior
+
+```{r refprior}
+ref_standata <- standata
+ref_standata$lambda <- 0
+ref_smpl <- suppressMessages(
+  ci_model$sample(
+    data = ref_standata, iter_warmup = 2000, iter_sampling = 2500
+    , parallel_chains = 4, refresh = 0
+  )
+)
+```
+### Comparison between straPP and refernce prior
+
+We plot the posterior densities of the treatment effect for each prior.
+
+```{r}
+draws.ci  <- ci_smpl$draws(format = 'data.frame')
+draws.ref <- ref_smpl$draws(format = 'data.frame')
+draws.ci$Prior  <- 'CI Prior'
+draws.ref$Prior <- 'Reference'
+plot.df <- rbind(draws.ci, draws.ref)
+
+ggplot(
+  plot.df, aes(x = .data[['beta[2]']], color = Prior, fill = Prior)
+) +
+  geom_density(alpha = 0.5) +
+  scale_color_tableau() +
+  scale_fill_tableau()
+
+```
+
+
+

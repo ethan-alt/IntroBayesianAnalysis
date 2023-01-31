@@ -1,0 +1,268 @@
+---
+title: 'ESTEEM Study: Latent Exchangeability Prior (LEAP)'
+author: "Ethan Alt"
+date: "2023-01-24"
+output: 
+  html_document:
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+set.seed(123)
+knitr::opts_chunk$set(echo = TRUE)
+library(cmdstanr)
+check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
+register_knitr_engine(override = FALSE)
+```
+
+## Stan implementation of leap
+
+We now write the Stan code for the leap. We assume a normal linear model where
+we wish only to borrow from the intercept and covariates.
+
+We store the model in an object called `leap_model`.
+
+```{cmdstan, output.var="leap_model", message=FALSE}
+data {
+  int<lower=0> n;                    // current data sample size
+  int<lower=0> n0;                   // historical data sample size
+  int<lower=0> p;                    // number of covariates (excl. intercept and treatment effect)
+  vector[n] y;                       // current data outcomes
+  vector[n0] y0;                     // historical data outcomes
+  array[n] int<lower=0,upper=1> trt; // treatment assignment for current data
+  matrix[n,p] X;                     // design matrix of current data (incl intercept and trt)
+  matrix[n0,p] X0;                   // design matrix of historical data (incl intercept and trt)
+  real beta_mean;                    // mean hyperparameter for initial prior on gamma
+  real<lower=0> beta_sd;             // sd hyperparameter for initial prior on gamma
+  real<lower=0,upper=1> prob_upper;  // upper limit for uniform prior on probability of being exchangeable
+}
+transformed data {
+  vector[n] trtvec = to_vector(trt);
+}
+parameters {
+  real intercept;
+  real intercept_unexch;
+  vector[p] beta_x;
+  real trteff;
+  real<lower=0> sigma;
+  real<lower=0,upper=prob_upper> prob_exch;
+}
+transformed parameters {
+  vector[n0] loglik_contrib;
+  for ( i in 1:n0 ) {
+    loglik_contrib[i] = log_mix(
+      prob_exch
+      , normal_lpdf(y0[i] | intercept + dot_product(X0[i, ], beta_x), sigma)
+      , normal_lpdf(y0[i] | intercept_unexch + dot_product(X0[i, ], beta_x) , sigma)
+    );
+  }
+}
+model {
+  // Temporary variable
+  vector[n] mu = intercept + trteff * trtvec + X * beta_x;   // mean of current data
+  
+  // Initial prior
+  intercept ~ normal(beta_mean, beta_sd);
+  intercept_unexch ~ normal(beta_mean, beta_sd);
+  trteff ~ normal(beta_mean, beta_sd);
+  beta_x ~ normal(beta_mean, beta_sd);
+  //beta_x_unexch ~ normal(beta_mean, beta_sd);
+  sigma ~ cauchy(0, 1);
+  //sigma_unexch ~ cauchy(0, 1);
+  
+  // LEAP: historical data is mixture model
+  target += loglik_contrib;
+  
+  // Likelihood
+  y ~ normal(mu, sigma);
+}
+
+generated quantities {
+  real log_prob = log(prob_exch);
+  array[n0] int<lower=0,upper=1> c0;
+  for ( i in 1:n0 ) {
+    // compute contribution to log likelihood
+    c0[i] = bernoulli_rng(
+        exp(
+            log_prob + normal_lpdf(y0[i] | intercept + dot_product(X0[i, ], beta_x), sigma)
+          - loglik_contrib[i]
+        )
+    );
+  }
+}
+
+```
+
+## R code for analysis
+
+### Obtaining the data
+
+We can obtain the data directly from GitHub.
+
+```{r data, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(cmdstanr)
+library(bayesplot)
+library(posterior)
+library(ggthemes)
+
+
+url <- 'https://raw.githubusercontent.com/ethan-alt/IntroBayesianAnalysis/main/Data'
+esteem1 <- read.csv(file.path(url, 'esteem1.csv'))
+esteem2 <- read.csv(file.path(url, 'esteem2.csv'))
+
+## Keep only full data
+esteem1 <- esteem1[complete.cases(esteem1), ]
+esteem2 <- esteem2[complete.cases(esteem2), ]
+
+## Subset for historical controls
+esteem1 <- esteem1 %>% filter(treatment == 'Placebo')
+
+## Declare placebo as reference group
+esteem1$treatment <- factor(esteem1$treatment, levels = c('Placebo', '30 mg BID'))
+esteem2$treatment <- factor(esteem2$treatment, levels = c('Placebo', '30 mg BID'))
+
+## First few lines of esteem1
+head(esteem1)
+
+## First few lines of esteem2
+head(esteem2)
+```
+
+
+### Constructing the Stan data
+
+We now construct the Stan data.
+
+```{r standata}
+## 0+ excludes intercept term
+formula <- pasi_pchg ~ 0  + scale(pasi_bsl) + scale(age) + I(scale(age)^2) + smoke + prior_sys
+
+
+standata <- list(
+  'y' = esteem2[, all.vars(formula)[1]]
+  , 'y0' = esteem1[, all.vars(formula)[1]]
+  , 'trt' = ifelse(esteem2$treatment == 'Placebo', 0, 1)
+  , 'X' = model.matrix(formula, esteem2)
+  , 'X0' = model.matrix(formula, esteem1)
+  , 'beta_mean' = 0
+  , 'beta_sd' = 10
+)
+standata$n  <- nrow(standata$X)
+standata$n0 <- nrow(standata$X0)
+standata$p  <- ncol(standata$X)
+n00 <- nrow(esteem1 %>% filter(treatment == 'Placebo'))
+n10 <- nrow(esteem2 %>% filter(treatment == 'Placebo'))
+(standata$prob_upper = min(1, n10 / n00) )
+```
+
+
+### Performing the MCMC sampling and conducting the analysis
+
+We call the `sample()` method from `cmdstanr` to perform MCMC.
+
+```{r mcmc, warning = FALSE, message = FALSE}
+leap_smpl <- suppressMessages(
+  leap_model$sample(
+  data = standata, iter_warmup = 1000, iter_sampling = 2500, parallel_chains = 4
+  , chains = 4, refresh = 0
+)
+)
+```
+
+
+```{r summary}
+leap_smpl$summary(
+  variables = c('intercept', 'trteff', 'prob_exch', 'sigma', 'intercept_unexch'
+    # , 'sigma_unexch'
+  )
+  , mean, sd, 'q' = ~quantile2(.x, probs = c(0.025, 0.975))
+)
+```
+
+
+#### Summary of who is exchangeable
+
+We can see who is driving the borrowing by looking at the predicted classes
+
+```{r class}
+leap_smpl$summary(variables = 'c0')
+```
+
+
+```{r diagnostics}
+leap_draws <- leap_smpl$draws(format = 'draws_df')
+leap_draws %>% mcmc_trace(pars = c('intercept', 'trteff', 'prob_exch'))
+```
+
+
+### Comparison to a reference prior (no borrowing)
+
+#### Stan code
+
+We implement code that does no borrowing and assumes 
+$\beta_j \sim N(0, 10^2)$ a priori
+and $\sigma \sim \text{Half-Cauchy}(0, 1)$ a priori.
+
+```{cmdstan, output.var="ref_model", message=FALSE}
+data {
+  int<lower=0> n;                    // current data sample size
+  int<lower=0> p;                    // number of covariates (excl intercept and trteff)
+  vector[n] y;                       // current data outcomes (continuous)
+  array[n] int<lower=0,upper=1> trt; // treatment assignment
+  matrix[n,p] X;                     // design matrix of current data (incl intercept and trt)
+}
+transformed data {
+  vector[n] trtvec = to_vector(trt);
+}
+parameters {
+  real intercept;         // intercept for current data
+  real trteff;            // treatment effect for current data
+  vector[p] beta_x;       // regression coefficients for covariates
+  real<lower=0> sigma;    // SD parameter
+}
+model {
+  vector[n] mu = intercept + trteff * trtvec + X * beta_x;
+  // Initial prior
+  intercept ~ normal(0, 10);
+  beta_x ~ normal(0, 10);
+  sigma ~ cauchy(0, 1);
+  
+  // Likelihood
+  y ~ normal(mu, sigma);
+}
+```
+
+#### R code for analysis with reference prior
+
+```{r refprior}
+ref_smpl <- suppressMessages(
+  ref_model$sample(
+    data = standata, iter_warmup = 2000, iter_sampling = 2500
+    , parallel_chains = 4, refresh = 0
+  )
+)
+```
+### Comparison between straPP and refernce prior
+
+We plot the posterior densities of the treatment effect for each prior.
+
+```{r}
+trteff.leap <- leap_smpl$draws(variables = c('intercept', 'trteff'), format = 'data.frame')
+trteff.ref <- ref_smpl$draws(variables = c('intercept', 'trteff'), format = 'data.frame')
+trteff.leap$Prior <- 'LEAP'
+trteff.ref$Prior <- 'Reference'
+plot.df <- rbind(trteff.ref, trteff.leap)
+
+ggplot(
+  plot.df, aes(x = trteff, color = Prior, fill = Prior)
+) +
+  geom_density(alpha = 0.5) +
+  scale_color_tableau() + 
+  scale_fill_tableau()
+
+```
+
+
+

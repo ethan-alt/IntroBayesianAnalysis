@@ -1,0 +1,92 @@
+---
+title: "Pluto Trial: Jeffrey's Prior"
+author: "Ethan Alt"
+date: "01/27/2023"
+output: 
+  html_document:
+  theme: united
+highlight: tango
+---
+  
+```{r setup, include=FALSE}
+set.seed(1234)
+knitr::opts_chunk$set(echo = TRUE)
+library(cmdstanr)
+check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
+register_knitr_engine(override = FALSE)
+```
+
+
+### Stan code
+
+Below, we implement the Stan code for the commensurate prior. The compiled
+object exists in a variable named `jeffreys_model`.
+
+```{cmdstan, output.var="jeffreys_model", message=FALSE}
+data {
+  int<lower=0> ntrt;                     // num. treated patients in current data set
+  int<lower=0> nctrl;                    // num. placebo patients in current data set
+}
+transformed data {
+  int n = ntrt + nctrl;
+  int p = 2;
+  matrix[n,p] X;
+  X[, 1] = rep_vector(1, n);
+  X[1:nctrl, 2] = rep_vector(0, nctrl);
+  X[(nctrl+1):n, 2] = rep_vector(1, ntrt);
+}
+parameters {
+  vector[p] beta;
+}
+model {
+  vector[n] prob = inv_logit(X * beta);
+  vector[n] w = prob .* (1 - prob);
+  target += log_determinant_spd( X' * diag_pre_multiply(w, X) );
+}
+generated quantities {
+  real theta1 = inv_logit(beta[1] + beta[2]);
+  real theta0 = inv_logit(beta[1]);
+  real risk_difference = theta1 - theta0;
+}
+```
+
+
+
+### Analysis in R
+
+#### Load packages
+
+```{r, message = F, warning = F}
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(tidyverse)
+library(ggthemes)
+```
+
+#### Creation of the Stan data
+
+Now, we must tell `stan` what the variables named in the `data{}` block are.
+This is done by creating a named list as follows.
+
+```{r, warning = FALSE}
+## Create data set
+standata <- list(
+  'J'      = 3
+  , 'ntrt'   = 53
+  , 'nctrl'  = 39
+)
+
+## Conduct MCMC sampling
+jeffreys_smpl <- suppressMessages( jeffreys_model$sample(
+  data = standata, iter_warmup = 2000, iter_sampling = 10000, refresh = 0
+  , chains = 4, parallel_chains = 4
+)
+)
+```
+
+```{r plots}
+jeffreys_smpl$draws() %>% mcmc_hist(
+  pars = c('beta[1]', 'beta[2]', 'theta1', 'theta0', 'risk_difference')
+)
+```

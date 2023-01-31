@@ -1,0 +1,177 @@
+---
+title: 'ESTEEM Study: Partial Borrowing Power Prior (PBPP)'
+author: "Ethan Alt"
+date: "2023-01-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+set.seed(123)
+knitr::opts_chunk$set(echo = TRUE)
+library(cmdstanr)
+check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
+register_knitr_engine(override = FALSE)
+```
+
+## Stan implementation of PBPP
+
+We now write the Stan code for the PBPP. We assume a normal linear model where
+we wish only to borrow from the intercept and covariates.
+
+We store the model in an object called `pbpp_model`.
+
+```{cmdstan, output.var="pbpp_model", message=FALSE}
+data {
+  int<lower=0> n;            // current data sample size
+  int<lower=0> n0;           // historical data sample size
+  int<lower=0> p;            // number of covariates (incl. intercept and trteff)
+  vector[n] y;               // current data outcomes
+  vector[n0] y0;             // historical data outcomes
+  matrix[n,p] X;             // design matrix of current data (incl intercept and trt)
+  matrix[n0,p] X0;           // design matrix of historical data (incl intercept and trt)
+  real<lower=0,upper=1> a0;  // discounting parameter
+  real beta_mean;            // mean hyperparameter for initial prior on beta
+  real<lower=0> beta_sd;     // sd hyperparameter for initial prior on beta
+}
+parameters {
+  real intercept;         // intercept (borrowed)
+  real trteff;            // treatment effect for current
+  real trteff_hist;       // treatment effect for historical (not borrowed)
+  vector[p-2] beta_x;     // covariates (borrowed)
+  real<lower=0> sigma;    // SD parameter (borrowed)
+}
+transformed parameters {
+  vector[p] beta = append_row(intercept, append_row(trteff, beta_x));           // = (intercept, trteff, beta_x)
+  vector[p] beta_hist = append_row(intercept, append_row(trteff_hist, beta_x)); // = (intercept, trteff_hist, beta_x)
+}
+model {
+  // Initial prior
+  intercept ~ normal(beta_mean, beta_sd);
+  trteff ~ normal(beta_mean, beta_sd);
+  trteff_hist ~ normal(beta_mean, beta_sd);
+  beta_x ~ normal(beta_mean, beta_sd);
+  sigma ~ cauchy(0, 1);
+  
+  // Power prior (discounted likelihood)
+  target += a0 * normal_id_glm_lpdf(y0 | X0, 0, beta_hist, sigma);
+  
+  // Likelihood
+  y ~ normal_id_glm(X, 0, beta, sigma);
+}
+```
+
+## R code for analysis
+
+### Obtaining the data
+
+We can obtain the data directly from GitHub.
+
+```{r data, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(cmdstanr)
+library(bayesplot)
+library(posterior)
+library(ggthemes)
+
+
+url <- 'https://raw.githubusercontent.com/ethan-alt/IntroBayesianAnalysis/main/Data'
+esteem1 <- read.csv(file.path(url, 'esteem1.csv'))
+esteem2 <- read.csv(file.path(url, 'esteem2.csv'))
+
+## Keep only full data
+esteem1 <- esteem1[complete.cases(esteem1), ]
+esteem2 <- esteem2[complete.cases(esteem2), ]
+
+## Declare placebo as reference group
+esteem1$treatment <- factor(esteem1$treatment, levels = c('Placebo', '30 mg BID'))
+esteem2$treatment <- factor(esteem2$treatment, levels = c('Placebo', '30 mg BID'))
+
+## First few lines of esteem1
+head(esteem1)
+
+## First few lines of esteem2
+head(esteem2)
+```
+
+
+### Constructing the Stan data
+
+We now construct the Stan data.
+
+```{r standata}
+formula <- pasi_pchg ~ treatment + scale(pasi_bsl) + scale(age) + I(scale(age)^2) + smoke + prior_sys
+
+
+standata <- list(
+  'y' = esteem2[, all.vars(formula)[1]]
+  , 'X' = model.matrix(formula, esteem2)
+  , 'y0' = esteem1[, all.vars(formula)[1]]
+  , 'X0' = model.matrix(formula, esteem1)
+  , 'beta_mean' = 0
+  , 'beta_sd' = 10
+)
+standata$n  <- nrow(standata$X)
+standata$n0 <- nrow(standata$X0)
+standata$p  <- ncol(standata$X)
+(standata$a0 <- min(1, standata$n / standata$n0))
+```
+
+
+### Performing the MCMC sampling and conducting the analysis
+
+We call the `sample()` method from `cmdstanr` to perform MCMC.
+
+```{r mcmc, warning = FALSE, message = FALSE}
+pbpp_smpl <- suppressMessages(
+  pbpp_model$sample(
+  data = standata, iter_warmup = 2000, iter_sampling = 4000, parallel_chains = 4
+  , refresh = 0
+)
+)
+pbpp_smpl$summary(
+  variables = NULL, mean, sd, 'q' = ~quantile2(.x, probs = c(0.025, 0.975))
+  , 'pr_lt_0' = ~mean(.x < 0)
+)
+```
+
+
+```{r diagnostics}
+pbpp_draws <- pbpp_smpl$draws(format = 'draws_df')
+```
+
+
+### Comparison to a reference prior (no borrowing)
+
+We can fit a non-borrowing method by setting $a_0 = 0$
+
+```{r reference}
+ref_standata <- standata
+ref_standata$a0 <- 0
+ref_smpl <- suppressMessages(
+    pbpp_model$sample(
+    data = ref_standata, iter_warmup = 2000, iter_sampling = 4000
+    , parallel_chains = 4, refresh = 0
+  )
+)
+ref_smpl$summary(
+  variables = NULL, mean, sd, 'q' = ~quantile2(.x, probs = c(0.025, 0.975))
+  , 'pr_lt_0' = ~mean(.x < 0)
+)
+```
+
+We can plot the posterior densities of the two treatment effects
+
+```{r comparison}
+trteff.pbpp <- pbpp_smpl$draws(variables = 'trteff', format = 'data.frame')
+trteff.ref <- ref_smpl$draws(variables = 'trteff', format = 'data.frame')
+trteff.pbpp$Prior <- 'PBPP (a0 = 0.48)'
+trteff.ref$Prior <- 'Reference (a0 = 0)'
+plot.df <- rbind(trteff.ref, trteff.pbpp)
+
+ggplot(
+  plot.df, aes(x = trteff, color = Prior, fill = Prior)
+) +
+  geom_density(alpha = 0.5) +
+  scale_color_tableau() + 
+  scale_fill_tableau()
+```

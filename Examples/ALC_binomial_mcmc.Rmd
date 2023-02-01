@@ -1,0 +1,168 @@
+---
+title: 'Sampling and Fitting Priors: Binomial Example with Non-Conjugate Priors'
+author: "Ethan Alt"
+date: "2023-02-01"
+output: 
+  html_document:
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+set.seed(123)
+knitr::opts_chunk$set(echo = TRUE)
+library(cmdstanr)
+check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
+register_knitr_engine(override = FALSE)
+```
+
+
+### Binomial Proportion ALC
+
+* Consider an experiment that generates $y \sim \text{Binomial}\left(n, \theta\right)$. 
+
+* We wish to determine the required value of $n$ such that average length of the 95\% credible interval is less than $w=0.10$ (ALC). \\
+
+* We consider conjugate sampling and fitting priors as shown:
+
+$$
+\begin{eqnarray*}
+    \pi_s(\theta) & \propto & \text{Normal}\left(\mu = 0.2,\sigma = 1.1 \right) \times 1\left(\theta \in [0,1]\right) \\
+    \pi_f(\theta) & \propto & \text{Normal}\left(\mu = 0.5,\sigma = 2.0 \right) \times 1\left(\theta \in [0,1]\right) 					
+\end{eqnarray*}
+$$
+
+### Stan code
+
+We first write Stan code to sample from the posterior densities of any number
+of sampling prior samples (`ndatasets`). Writing it this way is more efficient
+than iterating through created data sets and analyzing them one-by-one.
+
+```{cmdstan, output.var="binomial_mcmc", message=FALSE}
+data {
+  int<lower=0> ndatasets;                   // number of total data sets (number of samples from sampling prior)
+  int<lower=0> n;                           // sample size
+  array[ndatasets] int<lower=0,upper=n> y;  // samples from the predictive distribution of sampling prior
+  real fitting_prior_mean;                  // mean parameter for truncated normal prior on probability
+  real<lower=0> fitting_prior_sd;           // SD parameter for truncated normal prior on probability
+}
+parameters {
+  vector<lower=0,upper=1>[ndatasets] theta;  // success probabilities (one sample for each data set)
+}
+model {
+  // fitting prior
+  theta ~ normal(fitting_prior_mean, fitting_prior_sd);
+  // likelihoods
+  y ~ binomial(n, theta);
+}
+```
+
+
+### R code
+
+Now, we create a function to sample from the predictive distribution of the
+sampling prior
+
+```{r vprior}
+library(cmdstanr)
+library(tidyverse)
+library(posterior)
+library(kableExtra)
+library(truncnorm)
+
+#' Sample from predictive distribution of sampling prior (truncated normal)
+#' 
+#' @param n number of Bernoulli trials (i.e., sample size)
+#' @param sampling.prior.mean mean hyperparameter for truncated normal sampling prior
+#' @param sampling.prior.sd SD hyperparameter for truncated normal sampling prior
+#' @param ndatasets number of sampling prior draws
+#' 
+#' @return 
+sample.vprior <- function(
+    n, sampling.prior.mean = 0.2, sampling.prior.sd = 1.1, ndatasets = 5000
+) {
+  ## Sample from truncated normal
+  theta <- rtruncnorm(ndatasets, a = 0, b = 1, mean = sampling.prior.mean, sd = sampling.prior.sd)
+  ## Sample y | theta (prior predictive)
+  y <- rbinom(ndatasets, size = n, prob = theta)
+  ## Return y
+  y
+}
+```
+
+We now create a function that:
+
+1. Obtains `ndatasets` samples from the predictive distribution of the sampling prior.
+
+2. Samples from the posterior distribution of each data set.
+
+3. Computes the 95\% credible intervals (CIs) and the width of each CI.
+
+4. Computes the average CI width.
+
+```{r alc}
+#' Compute average credible interval length
+#' 
+#' @param n sample size
+#' @param ndatasets number of data sets to create
+#' @param sampling.prior.mean mean hyperparameter for truncated normal sampling prior
+#' @param sampling.prior.sd standard deviation hyperparameter for truncated normal sampling prior
+#' @param fitting.prior.mean mean hyperparameter for truncated normal fitting prior
+#' @param fitting.prior.sd standard deviation hyperparameter for truncated normal fitting prior
+#' @param alpha how to compute the credible interval (e.g., 1 - alpha credible interval is computed)
+#' @param ... other arguments to pass onto `cmdstanr::sample`
+alc.mcmc <- function(
+    n, ndatasets
+    , sampling.prior.mean = 0.2, sampling.prior.sd = 1.1
+    , fitting.prior.mean = 0.5, fitting.prior.sd = 2.0
+    , alpha = 0.05
+    , ...
+) {
+  ## Step 1. Obtain `ndatasets` samples from sampling prior
+  y <- sample.vprior(n, sampling.prior.mean, sampling.prior.sd, ndatasets)
+  
+  ## Step 2. Sample from the posterior distribution for each data set
+  standata <- list(
+    y = y, n = n, ndatasets = ndatasets
+    , fitting_prior_mean = fitting.prior.mean
+    , fitting_prior_sd = fitting.prior.sd
+  )
+  smpl <- binomial_mcmc$sample(data = standata, ...)
+  
+  ## Step 4. Compute the 1 - alpha credible interval for each data set and
+  ##         compute the mean CI width
+  plow  <- alpha / 2
+  phigh <- 1 - plow
+  avg.ci.width <- smpl$summary(
+    variables = 'theta', 
+    q = ~quantile2(.x, probs = c(0.025, 0.975))
+  ) %>%
+    mutate(ci_width = q97.5 - q2.5) %>%
+    summarize(mean_width = mean(ci_width)) %>%
+    unlist
+  
+  ## Return result
+  c(n = n, avg_ci_width = avg.ci.width)
+}
+```
+
+We now call the function using the default parameters and `ndatasets = 5000`.
+
+```{r, results = "hide"}
+res <- sapply(
+  seq(200, 300, by = 25)
+  , FUN = function(n) alc.mcmc(
+    n, ndatasets = 5000, refresh = 0
+  , iter_warmup = 1000, iter_sampling = 2000
+  , parallel_chains = 5, chains = 5
+  )
+)
+```
+
+
+```{r}
+data.frame(t(res)) %>% kable(digits = 4)
+```
+
+
+

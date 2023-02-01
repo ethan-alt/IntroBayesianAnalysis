@@ -1,0 +1,120 @@
+---
+title: 'Sampling and Fitting Priors: Binomial Example'
+author: "Ethan Alt"
+date: "2023-02-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Binomial Proportion ALC
+
+* Consider an experiment that generates $y \sim \text{Binomial}\left(n, \theta\right)$. 
+
+* We wish to determine the required value of $n$ such that average length of the 95\% credible interval is less than $w=0.10$ (ALC). \\
+
+* We consider conjugate sampling and fitting priors as shown:
+
+$$
+\begin{eqnarray*}
+    \pi_s(\theta) & \propto & \text{Beta}\left(\alpha_1 = 2.0,\alpha_2 = 8.0 \right) \\
+    \pi_f(\theta) & \propto & \text{Beta}\left(\alpha_1 = 1.0,\alpha_2 = 1.0 \right)					
+\end{eqnarray*}
+$$
+
+### R code
+
+We begin by creating a function to compute ALC.
+
+```{r, warning = FALSE, message = FALSE}
+## Function to perform assurance calculation based on ALC for binomial proportion
+#' @param w desired \math{1 - alpha / 2} credible interval width
+#' @param alpha value for a \math{1 - alpha / 2} credible interval
+#' @param sampling.shape1 first shape parameter for beta sampling prior
+#' @param sampling.shape2 second shape parameter for beta sampling prior
+#' @param fitting.shape1 first shape parameter for beta fitting prior
+#' @param fitting.shape2 second shape parameter for beta fitting prior
+#' @param sample.size vector of sample sizes to compute CI widths
+#' @param ndatasets number of simulated data sets
+assurance.alc <- function(
+  w = 0.10, alpha = 0.05
+  , sampling.shape1 = 2, sampling.shape2 = 8
+  , fitting.shape1 = 1, fitting.shape2 = 1
+  , sample.size = seq(150, 250, by = 1)
+  , ndatasets = 10000
+) {
+  ## vector to store results
+  widths <- numeric(length(sample.size))
+  ## compute probabilities for quantiles based on alpha
+  plow  <- alpha / 2
+  phigh <- 1 - plow
+  ## loop through sample sizes
+  for ( i in seq_along(sample.size) ) {
+    ## Obtain samples from sampling prior
+    sprior.sample <- rbeta(
+      n = ndatasets, shape1 = sampling.shape1, shape2 = sampling.shape2
+    )
+    ## Sample from predictive distribution of the sampling prior
+    y.sprior.sample <- rbinom(n = ndatasets, size = sample.size[i], prob = sprior.sample)
+    ## Compute parameters for posterior distribution (beta since conjugate)
+    fitting.shape1.post <- y.sprior.sample + fitting.shape1
+    fitting.shape2.post <- sample.size[i] - y.sprior.sample + fitting.shape2
+    ## Compute average width of the CI
+    widths[i] <-  mean(
+        qbeta(phigh, fitting.shape1.post, fitting.shape2.post)
+      - qbeta(plow, fitting.shape1.post, fitting.shape2.post)
+    )
+  }
+  ## return results from simulation
+  data.frame('n' = sample.size, 'width' = widths)
+}
+```
+
+We may now call the created function and plot the results.
+
+```{r, message = FALSE, warning = FALSE}
+## Load packages
+library(tidyverse)
+
+
+## Get simulation
+sims <- assurance.alc()
+
+## Plot
+ggplot(data = sims, aes(x = n, y = width)) + 
+  geom_point() + 
+  geom_line()
+```
+
+Notice that the curve is nonmonotone. This is due to Monte Carlo error.
+
+For a better estimate, we can conduct scatterplot smoothing to obtain a
+smooth estimate of the curve.
+
+```{r}
+fit.loess <- loess(width ~ n, data = sims)
+sims$width.sm <- predict(fit.loess)
+```
+
+Now, we can obtain the estimated sample size
+
+```{r}
+(nopt <- sims$n[which(sims$width.sm < 0.10)[1]])
+```
+
+```{r}
+ggplot(data = sims, aes(x = n)) +
+  geom_point(aes(y = width), color = 'blue') + 
+  geom_line(aes(y = width.sm), color = 'red') + 
+  geom_hline(aes(yintercept = 0.10)) + 
+  geom_vline(aes(xintercept = nopt)) +
+  ylab("CI Width") + 
+  xlab("Sample size") + 
+  ggtitle("Assurance calculation: binomial proportion with ALC criterion")
+```
+
+
+
+

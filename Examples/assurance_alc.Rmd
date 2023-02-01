@@ -2,7 +2,10 @@
 title: 'Sampling and Fitting Priors: Binomial Example'
 author: "Ethan Alt"
 date: "2023-02-01"
-output: html_document
+output: 
+  html_document:
+    theme: united
+    highlight: tango
 ---
 
 ```{r setup, include=FALSE}

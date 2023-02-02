@@ -1,0 +1,201 @@
+---
+title: 'Sampling and Fitting Priors: Bayesian Power and Type I Error Rate'
+author: "Ethan Alt"
+date: "2023-02-02"
+output: 
+  html_document:
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Binomial Proportion Type I Error
+
+* Consider an experiment that generates $y \sim \text{Binomial}\left(n, \theta\right)$. 
+
+* We wish to determine the required value of $n$ such that the posterior probability $\Pr(\theta < 0.5 | D) \ge 0.975$
+
+* We consider conjugate sampling and fitting priors.
+
+### R code
+
+We begin by creating a function to compute assurance by:
+
+1. Sampling from a specified sampling prior and its predictive distribution
+
+2. Analyzing the generated data from step (1) using the fitting prior.
+
+3. Computing the resulting posterior probability
+
+```{r, warning = FALSE, message = FALSE}
+## Function to perform assurance calculation based on ALC for binomial proportion
+#' @param value.null value of the null hypothesis
+#' @param alpha value for a \math{1 - alpha / 2} credible interval
+#' @param sampling.mean mean parameter for beta sampling prior
+#' @param sampling.disp dispersion parameter for beta sampling prior. If infinity, a point mass at sampling.mean
+#' @param fitting.mean mean parameter for beta fitting prior
+#' @param fitting.disp dispersion shape parameter for beta fitting prior
+#' @param sample.size vector of sample sizes to compute CI widths
+#' @param ndatasets number of simulated data sets
+assurance <- function(
+  value.null
+  , sample.size = seq(10, 100, by = 1)
+  , alpha = 0.05
+  , sampling.mean = 0.2, sampling.disp = 10
+  , fitting.mean = 0.5, fitting.disp = 1
+  , ndatasets = 10000
+) {
+  ## Compute shape parameters
+  sampling.shape1 <- sampling.disp * sampling.mean
+  sampling.shape2 <- sampling.disp * (1 - sampling.mean)
+  fitting.shape1  <- fitting.disp * fitting.mean
+  fitting.shape2  <- fitting.disp * (1 - fitting.mean)
+  ## vector to store results
+  post.probs <- matrix(nrow = ndatasets, ncol = length(sample.size))
+  thresh     <- 1 - alpha/2
+  ## loop through sample sizes
+  for ( i in seq_along(sample.size) ) {
+    ## Obtain samples from sampling prior
+    if ( sampling.disp < Inf ) {
+      sprior.sample <- rbeta(
+        n = ndatasets, shape1 = sampling.shape1, shape2 = sampling.shape2
+      )
+      ## Sample from predictive distribution of the sampling prior
+      y.sprior.sample <- rbinom(n = ndatasets, size = sample.size[i], prob = sprior.sample)
+    } else {
+      ## Sample from a fixed probability at sampling.mean
+      y.sprior.sample <- rbinom(n = ndatasets, size = sample.size[i], prob = sampling.mean)
+    }
+    ## Compute parameters for posterior distribution (beta since conjugate)
+    fitting.shape1.post <- y.sprior.sample + fitting.shape1
+    fitting.shape2.post <- sample.size[i] - y.sprior.sample + fitting.shape2
+    ## Compute posterior probability
+    post.probs[, i] <- pbeta(value.null, fitting.shape1.post, fitting.shape2.post, lower.tail = TRUE)
+  }
+  data.frame(n = sample.size, assurance = colMeans(post.probs >= thresh))
+}
+```
+
+
+### Bayesian power
+
+We may now call the created function and plot the results.
+
+```{r, message = FALSE, warning = FALSE}
+## Load packages
+library(tidyverse)
+library(ggthemes)
+
+## Power simulations
+   ## Beta(2, 8) sampling prior
+       ## Uniform fitting prior
+       assurance.random.noninform <- assurance(
+         value.null = 0.5, ndatasets = 100000
+         , sampling.mean = 2/10, sampling.disp = 10
+         , fitting.mean = 0.5, fitting.disp = 1
+       )
+       assurance.random.noninform$sampling.prior = 'Beta(2, 8)'
+       assurance.random.noninform$fitting.prior = 'U(0, 1)'
+       ## Beta(3, 6) fitting prior
+       assurance.random.inform <- assurance(
+         value.null = 0.5, ndatasets = 100000
+         , sampling.mean = 2/10, sampling.disp = 10
+         , fitting.mean = 2/10, fitting.disp = 10
+        )
+       assurance.random.inform$sampling.prior = 'Beta(2, 8)'
+       assurance.random.inform$fitting.prior = 'Beta(2, 8)'
+   ## Point mass prior at 0.2
+       ## Uniform fitting prior
+       assurance.pointmass.noninform <- assurance(
+         value.null = 0.5, ndatasets = 100000
+         , sampling.mean = 2/10, sampling.disp = Inf
+         , fitting.mean = 0.5, fitting.disp = 1
+       )
+       assurance.pointmass.noninform$sampling.prior = 'Point mass'
+       assurance.pointmass.noninform$fitting.prior = 'U(0, 1)'
+       ## Beta(3, 6) fitting prior
+       assurance.pointmass.inform <- assurance(
+         value.null = 0.5, ndatasets = 100000
+         , sampling.mean = 2/10, sampling.disp = Inf
+         , fitting.mean = 2/10, fitting.disp = 10
+        )
+        assurance.pointmass.inform$sampling.prior = 'Point mass'
+        assurance.pointmass.inform$fitting.prior = 'Beta(2, 8)'
+```
+```{r}
+## Combine sims
+sims <- rbind(assurance.random.noninform, assurance.random.inform, assurance.pointmass.noninform, assurance.pointmass.inform)
+
+## Plot
+ggplot(
+  data = sims, 
+  aes(x = n, y = assurance
+      , color = fitting.prior, fill = fitting.prior
+      , linetype = sampling.prior, shape = sampling.prior
+  )
+) + 
+  geom_line(
+    stat="smooth",method = "lm", formula = y ~ 0 + I(1/x) + I((x-1)/x)
+    , alpha = 0.5, linewidth = 1
+  ) +
+  ggtitle("Bayesian power (assurance)") + 
+  scale_color_tableau() + 
+  scale_fill_tableau() + 
+  geom_hline(yintercept = 0.8)
+```
+
+
+### Type I error
+
+We now compute the Bayesian version of type I error using a point-mass 
+sampling prior at the null hypothesis given by
+
+$$
+  \pi_s(\theta) = 1\{ \theta = 0.5 \}.
+$$
+
+```{r type1error}
+## Type I error simulations using point mass prior at 0.5
+## Uniform fitting prior
+type1error.pointmass.noninform <- assurance(
+ value.null = 0.5, ndatasets = 100000
+ , sampling.mean = 0.5, sampling.disp = Inf
+ , fitting.mean = 0.5, fitting.disp = 1
+)
+type1error.pointmass.noninform$sampling.prior = 'Point mass'
+type1error.pointmass.noninform$fitting.prior = 'U(0, 1)'
+## Beta(3, 6) fitting prior
+type1error.pointmass.inform <- assurance(
+ value.null = 0.5, ndatasets = 100000
+ , sampling.mean = 0.5, sampling.disp = Inf
+ , fitting.mean = 2/10, fitting.disp = 10
+)
+type1error.pointmass.inform$sampling.prior = 'Point mass'
+type1error.pointmass.inform$fitting.prior = 'Beta(3, 6)'
+```
+
+```{r}
+sims.type1error <- rbind(type1error.pointmass.noninform, type1error.pointmass.inform)
+
+## Plot
+ggplot(
+  data = sims.type1error, 
+  aes(x = n, y = assurance
+      , color = fitting.prior, fill = fitting.prior
+  )
+) + 
+  geom_line(
+    stat="smooth",method = "lm", formula = y ~ 0 + I(1/x) + I((x-1)/x)
+    , alpha = 0.5, linewidth = 1
+  ) +
+  ggtitle("Bayesian type I error") + 
+  scale_color_tableau() + 
+  scale_fill_tableau() +
+  geom_hline(aes(yintercept = 0.025)) +
+  ylab("Type I error")
+
+```
+

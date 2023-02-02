@@ -99,7 +99,7 @@ library(ggthemes)
        )
        assurance.random.noninform$sampling.prior = 'Beta(2, 8)'
        assurance.random.noninform$fitting.prior = 'U(0, 1)'
-       ## Beta(3, 6) fitting prior
+       ## Beta(2, 8) fitting prior
        assurance.random.inform <- assurance(
          value.null = 0.5, ndatasets = 100000
          , sampling.mean = 2/10, sampling.disp = 10
@@ -116,7 +116,7 @@ library(ggthemes)
        )
        assurance.pointmass.noninform$sampling.prior = 'Point mass'
        assurance.pointmass.noninform$fitting.prior = 'U(0, 1)'
-       ## Beta(3, 6) fitting prior
+       ## Beta(2, 8) fitting prior
        assurance.pointmass.inform <- assurance(
          value.null = 0.5, ndatasets = 100000
          , sampling.mean = 2/10, sampling.disp = Inf
@@ -144,7 +144,8 @@ ggplot(
   ggtitle("Bayesian power (assurance)") + 
   scale_color_tableau() + 
   scale_fill_tableau() + 
-  geom_hline(yintercept = 0.8)
+  geom_hline(yintercept = 0.8) +
+  ylim(0,1)
 ```
 
 
@@ -167,14 +168,14 @@ type1error.pointmass.noninform <- assurance(
 )
 type1error.pointmass.noninform$sampling.prior = 'Point mass'
 type1error.pointmass.noninform$fitting.prior = 'U(0, 1)'
-## Beta(3, 6) fitting prior
+## Beta(2, 8) fitting prior
 type1error.pointmass.inform <- assurance(
  value.null = 0.5, ndatasets = 100000
  , sampling.mean = 0.5, sampling.disp = Inf
  , fitting.mean = 2/10, fitting.disp = 10
 )
 type1error.pointmass.inform$sampling.prior = 'Point mass'
-type1error.pointmass.inform$fitting.prior = 'Beta(3, 6)'
+type1error.pointmass.inform$fitting.prior = 'Beta(2, 8)'
 ```
 
 ```{r}

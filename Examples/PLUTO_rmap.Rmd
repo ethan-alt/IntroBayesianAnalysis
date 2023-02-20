@@ -1,0 +1,266 @@
+---
+title: "Pluto Trial: Robust MAP Prior"
+author: "Ethan Alt"
+date: "01/27/2023"
+output: 
+  html_document:
+  theme: united
+highlight: tango
+---
+  
+```{r setup, include=FALSE}
+set.seed(1234)
+knitr::opts_chunk$set(echo = TRUE)
+library(cmdstanr)
+check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
+register_knitr_engine(override = FALSE)
+```
+
+
+### Stan code: Prior
+
+First, we implement the Stan code to sample from the prior induced by the BHM,
+also referred to as the meta-analytic predictive (MAP) prior.
+
+```{cmdstan output.var="map_prior"}
+data {
+  int<lower=0> J;                   // num. of historical data sets
+  array[J] int<lower=0> ntrt;       // num. treated patients in historical data sets
+  array[J] int<lower=0> nctrl;      // num. placebo patients in historical data sets
+  array[J] int<lower=0> ytrt;       // num. responders in treated group for historical data sets
+  array[J] int<lower=0> yctrl;      // num. responders in placebo group for historical data sets
+  real betamean_mean;               // mean parameter for hierarchical mean
+  real<lower=0> betamean_sd;        // sd parameter for hierarchical mean
+}
+parameters {
+  vector[J] intercept;             // intercept
+  vector[J] trteff;                // treatment effect
+  real intercept_mean;             // hierarchical mean for intercept
+  real trteff_mean;                // hierarchical mean for treatment effect
+  real<lower=0> intercept_sd;      // hierarchical SD For intercept
+  real<lower=0> trteff_sd;         // hierarchical SD for treatment effect
+}
+model {
+  // Priors for hierarchical parameters
+  intercept_mean ~ normal(betamean_mean, betamean_sd);
+  trteff_mean ~ normal(betamean_mean, betamean_sd);
+  intercept_sd ~ cauchy(0, 1);
+  trteff_sd ~ cauchy(0, 1);
+  // Loop through number of studies
+  for ( j in 1:J ) {
+    // Priors for model parameters
+    target += normal_lpdf(intercept[j] | intercept_mean, intercept_sd);
+    target += normal_lpdf(trteff[j] | trteff_mean, trteff_sd);
+    // Likelihood contribution
+    target += binomial_logit_lpmf(ytrt[j] | ntrt[j], intercept[j] + trteff[j]);
+    target += binomial_logit_lpmf(yctrl[j] | nctrl[j], intercept[j]);
+  }
+}
+generated quantities {
+  real intercept_pred = normal_rng(intercept_mean, intercept_sd);
+  real trteff_pred    = normal_rng(trteff_mean, trteff_sd);
+}
+```
+
+
+### Sampling from the prior of the MAP
+We now sample from the prior of the MAP.
+
+```{r}
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(tidyverse)
+library(ggthemes)
+priordata <- list(
+    'J'      = 2
+  , 'ntrt'  = c(273, 290)
+  , 'nctrl' = c(275, 287)
+  , 'ytrt'  = c(118, 167)
+  , 'yctrl' = c(93, 125)
+  , 'betamean_mean' = 0
+  , 'betamean_sd' = 5
+)
+map.prior.sample <- map_prior$sample(
+  data = priordata, iter_warmup = 2000, iter_sampling = 4000
+  , chains = 4, parallel_chains = 4, refresh = 0
+  , adapt_delta = 0.999
+)
+map.prior.draws <- map.prior.sample$draws(format = 'draws_df')
+map.prior.draws %>% summarize_draws()
+```
+
+```{r, echo = FALSE}
+library(ClusterR)   ## for GMM
+library(mixtools)   ## for GMM
+library(mclust)
+## Extract prior samples for regression coefficients for current data
+curdata.prior.sample <- map.prior.draws %>% 
+  select(c('intercept_pred', 'trteff_pred')) %>%
+  as.matrix()
+
+prior.approx <- Mclust(data = curdata.prior.sample, G = 9, verbose = FALSE)
+
+(approx.parms <- prior.approx$parameters)
+```
+
+
+```{r}
+probs <- approx.parms$pro
+means <- approx.parms$mean
+covs  <- approx.parms$variance$sigma
+covs[, , 1]
+covs  <- aperm(covs, perm = c(3, 1, 2))   ## this is how Stan understands arrays of matrices
+covs[1, , ]
+```
+
+```{r}
+round(probs, 3)
+round(means, 3)
+sds <- apply(covs, 1, function(x) sqrt(diag(x)))
+round(sds, 3)
+```
+
+
+Let's check to see how the approximation looks
+
+```{r}
+library(nimble) ## for categorical distribution sampling
+sample.z <- rcat(n = nrow(curdata.prior.sample), prob = probs)
+sample.x <- sapply(1:nrow(curdata.prior.sample), function(i) rmvnorm(1, means[, sample.z[i]], covs[sample.z[i], , ]) )
+sample.x <- t(sample.x)
+sample.x %>% summarize_draws()
+curdata.prior.sample %>% summarize_draws()
+```
+So the approximation fits quite well.
+
+
+Now, we must implement the approximation in Stan.
+
+
+```{cmdstan output.var="rmap_post"}
+functions {
+  //' Compute density of a mixture of multivariate normal distributions
+  //' @param x vector to evaluate density
+  //' @param probs array giving probabilities
+  //' @param means array of vectors giving means
+  //' @param covs array of covariance matrices
+  //' 
+  //' @return log density
+  real multi_normal_mix_lpdf(vector x, vector probs, array[] vector means, array[] matrix covs) {
+    int ncomponents = size(x);
+    vector[ncomponents] log_contrib;
+    for ( i in 1:ncomponents) {
+      log_contrib[i] = log(probs[i]) + multi_normal_lpdf(x | means[i], covs[i]);
+    }
+    return log_sum_exp(log_contrib);
+  }
+}
+data {
+  int<lower=0> ntrt;                      // number of treated group participants
+  int<lower=0> nctrl;                     // number of control group participants
+  int<lower=0,upper=ntrt> ytrt;           // number of responders in treated group
+  int<lower=0,upper=nctrl> yctrl;         // number of responders in control group
+  int<lower=0> ncomponents;               // num. components in MAP approximation
+  simplex[ncomponents] probs;             // probabilities for mixture of multivariate normal approx
+  array[ncomponents] vector[2] means;     // mean parameters for mixture of multivariate normal approximation
+  array[ncomponents] cov_matrix[2] covs;  // covariance parameters for mixture of multivariate normal approximation
+  real<lower=0,upper=1> vague_prob;       // mixture parameter corresponding to vague prior
+  real vague_mean;                        // mean parameter for vague prior
+  real<lower=0> vague_sd;                 // SD parameter for vague prior
+}
+parameters {
+  vector[2] beta;   // (intercept, trteff)
+}
+model {
+  // Prior on beta is a mixture of a vague prior and a MAP prior.
+  // Approximate MAP prior via mixture of multivariate normals
+  target += log_mix(
+    vague_prob
+    , normal_lpdf(beta | vague_mean, vague_sd)
+    , multi_normal_mix_lpdf(beta | probs, means, covs)
+  );
+  
+  // Likelihood
+  ytrt ~ binomial_logit(ntrt, sum(beta));
+  yctrl ~ binomial_logit(nctrl, beta[1]);
+}
+generated quantities {
+  real theta1 = inv_logit(sum(beta));
+  real theta0 = inv_logit(beta[1]);
+  real risk_difference = theta1 - theta0;
+}
+```
+
+
+### Loading the stan data
+
+```{r}
+standata <- list(
+  'ntrt'          = 53
+  , 'nctrl'       = 39
+  , 'ytrt'        = 28
+  , 'yctrl'       = 17
+  , 'probs'       = probs
+  , 'means'       = t(means)   ## stan array ordering is different than R
+  , 'covs'        = covs
+  , 'ncomponents' = length(probs)
+  , 'vague_prob'  = 0.9
+  , 'vague_mean'  = 0
+  , 'vague_sd'    = 10
+)
+
+smpl.rmap <- rmap_post$sample(
+  data = standata
+  , iter_warmup = 2000, iter_sampling = 2500, chains = 4, parallel_chains = 4
+  , refresh = 0
+)
+```
+```{r}
+smpl.rmap$summary(
+  variables = NULL, 'mean', 'sd', 'q' = ~quantile2(.x, probs = c(0.025, 0.975))
+)
+```
+
+
+```{r}
+standata$vague_prob = 0.90
+smpl2.rmap <- rmap_post$sample(
+  data = standata
+  , iter_warmup = 2000, iter_sampling = 2500, chains = 4, parallel_chains = 4
+  , refresh = 0
+)
+smpl2.rmap$summary(
+  variables = NULL, 'mean', 'sd', 'q' = ~quantile2(.x, probs = c(0.025, 0.975))
+)
+```
+
+
+
+```{r}
+standata$vague_prob = 0.50
+smpl3.rmap <- rmap_post$sample(
+  data = standata
+  , iter_warmup = 2000, iter_sampling = 2500, chains = 4, parallel_chains = 4
+  , refresh = 0
+)
+smpl3.rmap$summary(
+  variables = NULL, 'mean', 'sd', 'q' = ~quantile2(.x, probs = c(0.025, 0.975))
+)
+```
+
+
+
+### Plotting the difference
+
+```{r}
+riskdiff.rmap1 <- data.frame('prior' = 'rmap (p_v = 0.10)', 'risk_diff' = smpl.rmap$draws(variables = 'risk_difference', format = 'matrix'))
+riskdiff.rmap2 <- data.frame('prior' = 'rmap (p_v = 0.90)', 'risk_diff' = smpl2.rmap$draws(variables = 'risk_difference', format = 'matrix'))
+riskdiff.rmap3 <- data.frame('prior' = 'rmap (p_v = 0.50)', 'risk_diff' = smpl3.rmap$draws(variables = 'risk_difference', format = 'matrix'))
+plot.df <- rbind(riskdiff.rmap1, riskdiff.rmap2, riskdiff.rmap3)
+ggplot(
+  data = plot.df, aes(x = risk_difference, fill = prior)
+) +
+  geom_density(alpha = 0.5) +
+  scale_fill_tableau()
+```
